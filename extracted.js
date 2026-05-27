@@ -1,0 +1,1803 @@
+
+
+const SURL = 'https://paqiapihjnudbmpkrhbt.supabase.co'
+const SKEY = 'sb_publishable_zRXW63QiUAXcGgkUJjydvg_Eyy8u7B9'
+const sb = supabase.createClient(SURL, SKEY)
+
+let CU = null, prof = null, coins = 0
+let plW = 10, slW = 25, plBalls = 1, plRun = false, slRun = false
+let plStats = { wins: 0, losses: 0, totalWon: 0, totalLost: 0 }
+let stockPnl = { realized: 0, daily: 0 } // all-time realized gains from selling
+let plPegs = [], plBkts = [], plBall = null
+// curGroup declared below in groups section
+
+
+const DRINKS = ["Tito's Soda","Ranch Water","Espresso Martini","White Claw","Bud Light","Marg (frozen)","Vodka Soda","Whiskey Coke","Modelo","Coors Light"]
+const PLM = [6, 1.5, 0.4, 0.1, 0, 0.1, 0.4, 1.5, 6]
+const PLC = ['#00b894','#74b9ff','#a29bfe','#e17055','#d63031','#e17055','#a29bfe','#74b9ff','#00b894']
+
+
+function toast(msg, err=false) {
+  const t = document.getElementById('toast')
+  t.textContent = msg; t.className = 'toast' + (err?' err':'')
+  t.classList.add('show'); setTimeout(() => t.classList.remove('show'), 2500)
+}
+
+function updCoins(c) {
+  if (c === undefined || c === null) return
+  coins = Number(c)
+  const disp = coins.toLocaleString()
+  const ids = ['coin-disp','h-coins','cas-coins']
+  ids.forEach(id => { const e=document.getElementById(id); if(e) e.textContent = disp })
+}
+
+// ── AUTH ──────────────────────────────────────────────────────────────────
+let isSignup = false
+function toggleAuth() {
+  isSignup = !isSignup
+  document.getElementById('a-btn').textContent = isSignup ? 'Sign up' : 'Sign in'
+  document.getElementById('a-sw').innerHTML = isSignup ? 'Have an account? <span onclick="toggleAuth()">Sign in</span>' : 'No account? <span onclick="toggleAuth()">Sign up</span>'
+  document.getElementById('a-extra').style.display = isSignup ? 'block' : 'none'
+  document.getElementById('auth-err').style.display = 'none'
+}
+
+async function doAuth() {
+  const email = document.getElementById('a-email').value.trim()
+  const pass = document.getElementById('a-pass').value
+  const err = document.getElementById('auth-err')
+  const btn = document.getElementById('a-btn')
+  err.style.display = 'none'
+  if (!email || !pass) { err.textContent = 'Please fill in all fields'; err.style.display = 'block'; return }
+  btn.textContent = isSignup ? 'Signing up...' : 'Signing in...'
+  btn.disabled = true
+  if (isSignup) {
+    const name = document.getElementById('a-name').value.trim() || email.split('@')[0]
+    const uname = document.getElementById('a-user').value.trim() || email.split('@')[0]
+    const { data, error } = await sb.auth.signUp({ email, password: pass, options: { data: { display_name: name, username: uname } } })
+    if (error) { err.textContent = error.message; err.style.display = 'block'; btn.textContent = 'Sign up'; btn.disabled = false; return }
+    toast('Account created! Check email to verify, or sign in if email verification is off.')
+  } else {
+    const { data, error } = await sb.auth.signInWithPassword({ email, password: pass })
+    if (error) { err.textContent = error.message; err.style.display = 'block'; btn.textContent = 'Sign in'; btn.disabled = false; return }
+    await bootApp(data.user)
+  }
+  btn.disabled = false
+  btn.textContent = isSignup ? 'Sign up' : 'Sign in'
+}
+
+
+async function doSignOut() {
+  await sb.auth.signOut()
+  CU = null; prof = null; coins = 0
+  // Reset stock ticker interval
+  if (window._stockInterval) clearInterval(window._stockInterval)
+  if (window._refreshInterval) clearInterval(window._refreshInterval)
+  // Hide app, show login
+  document.getElementById('auth').style.display = 'flex'
+  document.getElementById('main').style.display = 'none'
+  // Reset login form
+  document.getElementById('a-btn').textContent = 'Sign in'
+  document.getElementById('a-btn').disabled = false
+  document.getElementById('a-email').value = ''
+  document.getElementById('a-pass').value = ''
+  document.getElementById('auth-err').style.display = 'none'
+  // Reset to sign-in mode
+  if (isSignup) toggleAuth()
+}
+
+// ── BOOT ──────────────────────────────────────────────────────────────────
+async function bootApp(user) {
+  CU = user
+  document.getElementById('auth').style.display = 'none'
+  document.getElementById('main').style.display = 'flex'
+  const { data: p, error: perr } = await sb.from('profiles').select('*').eq('id', user.id).single()
+  console.log('Profile:', p, 'Err:', perr)
+  if (p) {
+    prof = p; updCoins(p.coins)
+    document.getElementById('inv-code').textContent = p.invite_code || 'RND-' + user.id.slice(0,6).toUpperCase()
+    toast('Welcome ' + p.display_name + ' · ' + p.coins.toLocaleString() + ' coins')
+  } else {
+    const uname = user.email.split('@')[0]
+    const { data: np } = await sb.from('profiles').upsert({ id: user.id, username: uname, display_name: user.user_metadata?.display_name || uname, coins: 1000, invite_code: 'RND-' + user.id.slice(0,6).toUpperCase() }, { onConflict: 'id' }).select().single()
+    if (np) { prof = np; updCoins(np.coins); toast('Welcome ' + np.display_name) }
+  }
+  loadMarket(); loadGroups(); loadInvite()
+  window._refreshInterval = setInterval(refreshCoins, 30000)
+  checkMarketHours()
+  setTimeout(initPlinko, 100)
+  // Stock volatility - update prices randomly every 45 seconds
+  window._stockInterval = setInterval(updateStockPrices, 15000)
+}
+
+// ── SOCIAL STOCK MARKET ────────────────────────────────────────────────────
+const stockHistory = {} // { drink_name: [move1, move2, move3] }
+const BASE_PRICES = {
+  "Tito's Soda": 8.0, "Ranch Water": 7.5, "Espresso Martini": 10.0,
+  "White Claw": 5.0, "Bud Light": 3.0, "Marg (frozen)": 6.5,
+  "Vodka Soda": 6.0, "Whiskey Coke": 5.5, "Modelo": 4.0, "Coors Light": 3.5
+}
+
+// Called whenever a drink is logged - instant price bump
+async function onDrinkLogged(drinkName) {
+  const { data: s } = await sb.from('drink_stocks').select('*').eq('drink_name', drinkName).single()
+  if (!s) return
+  const bump = 0.3 + Math.random() * 0.2
+  const newPrice = Math.min(50, parseFloat((s.price + bump).toFixed(1)))
+  await sb.from('drink_stocks').update({ price: newPrice, prev_price: s.price, order_count: (s.order_count||0) + 1 }).eq('drink_name', drinkName)
+  if (document.getElementById('pg-home').classList.contains('on')) loadMarket()
+}
+
+// Called when shares are sold - instant price drop
+async function onSharesSold(drinkName, shares) {
+  const { data: s } = await sb.from('drink_stocks').select('*').eq('drink_name', drinkName).single()
+  if (!s) return
+  const drop = shares * 0.2 + Math.random() * 0.1
+  const newPrice = Math.max(1.0, parseFloat((s.price - drop).toFixed(1)))
+  await sb.from('drink_stocks').update({ price: newPrice, prev_price: s.price }).eq('drink_name', drinkName)
+}
+
+// Called when shares are bought - small price bump
+async function onSharesBought(drinkName) {
+  const { data: s } = await sb.from('drink_stocks').select('*').eq('drink_name', drinkName).single()
+  if (!s) return
+  const bump = 0.1 + Math.random() * 0.1
+  const newPrice = Math.min(50, parseFloat((s.price + bump).toFixed(1)))
+  await sb.from('drink_stocks').update({ price: newPrice, prev_price: s.price }).eq('drink_name', drinkName)
+}
+
+// Main 15-second tick - combines all factors
+async function updateStockPrices() {
+  const { data: stocks, error: se } = await sb.from('drink_stocks').select('*')
+  if (!stocks || se) return
+  const now = new Date()
+  const today = now.toDateString()
+  const fifteenAgo = new Date(Date.now()-15*60*1000).toISOString()
+  const { data: recentLogs } = await sb.from('drink_logs').select('drink_name,group_id').gte('logged_at', fifteenAgo)
+  const logsPerDrink = {}
+  ;(recentLogs||[]).forEach(l=>{ logsPerDrink[l.drink_name]=(logsPerDrink[l.drink_name]||0)+1 })
+  const activeGroups = new Set((recentLogs||[]).map(l=>l.group_id||'x')).size
+  const sentiment = Math.min(2.5, 1.0+activeGroups*0.3)
+  for (const s of stocks) {
+    if (!stockHistory[s.drink_name]) stockHistory[s.drink_name]=[]
+    const hist = stockHistory[s.drink_name]
+    const base = BASE_PRICES[s.drink_name]||5.0
+    const logs = logsPerDrink[s.drink_name]||0
+    // Very aggressive moves
+    const drinkFlow = logs * 1.2
+    const decay = logs===0 ? -(0.4+Math.random()*0.3) : -0.1
+    const reversion = (base-s.price)*0.12
+    const noise = (Math.random()-0.5)*2.0
+    let momentum = 0
+    if(hist.length>=3){
+      const allUp=hist.slice(-3).every(m=>m>0)
+      const allDown=hist.slice(-3).every(m=>m<0)
+      if(allUp) momentum=Math.random()<0.45?-1.2:0.4
+      if(allDown) momentum=Math.random()<0.35?0.9:-0.15
+    }
+    const spike = Math.random()<0.04?(Math.random()>0.5?2.0:-1.8):0
+    let move = drinkFlow+decay+reversion+momentum+noise+spike
+    if(move>0) move*=sentiment
+    hist.push(move); if(hist.length>5) hist.shift()
+    const newPrice = Math.max(0.5,Math.min(50.0,parseFloat((s.price+move).toFixed(1))))
+    const updates = {price:newPrice, prev_price:s.price}
+    if(!s.open_price||s.open_date!==today){updates.open_price=s.price;updates.open_date=today}
+    await sb.from('drink_stocks').update(updates).eq('id',s.id)
+  }
+  if(document.getElementById('pg-home')?.classList.contains('on')) loadMarket()
+}
+
+sb.auth.onAuthStateChange(async (ev, sess) => {
+  if ((ev === 'SIGNED_IN') && sess?.user && !CU) await bootApp(sess.user)
+})
+sb.auth.getSession().then(({ data: { session } }) => { if (session?.user) bootApp(session.user) })
+
+// ── NAV ───────────────────────────────────────────────────────────────────
+async function refreshCoins() {
+  if (!CU) return
+  const { data: p } = await sb.from('profiles').select('coins').eq('id', CU.id).single()
+  if (p) updCoins(p.coins)
+}
+
+async function goPage(id) {
+  document.querySelectorAll('.pg').forEach(p => p.classList.remove('on'))
+  document.querySelectorAll('.bni').forEach(b => b.classList.remove('on'))
+  document.getElementById('pg-' + id).classList.add('on')
+  const idx = { home:0, groups:1, casino:2, invite:3 }
+  document.querySelectorAll('.bni')[idx[id]].classList.add('on')
+  await refreshCoins()
+  if (id === 'home') loadMarket()
+  if (id === 'groups') loadGroups()
+  if (id === 'invite') loadInvite()
+  if (id === 'casino') setTimeout(initPlinko, 80)
+}
+
+function showCreateGroup() { openModal('modal-create-group') }
+function openModal(id) { document.getElementById(id).classList.add('show') }
+function closeModal(id) { document.getElementById(id).classList.remove('show') }
+
+// ── MARKET ────────────────────────────────────────────────────────────────
+function checkMarketHours() {
+  const h = new Date().getHours(), open = h >= 17 || h < 3
+  const b = document.getElementById('mkt-banner'), t = document.getElementById('mkt-status-text')
+  const badge = document.getElementById('mkt-badge')
+  if (open) {
+    b.className = 'mkt-banner mb-open'; t.textContent = 'Market open · 5pm–3am'
+    if(badge) badge.style.display = ''
+  } else {
+    b.className = 'mkt-banner mb-ah'; t.textContent = 'After hours · orders queued for 5pm open'
+    if(badge) badge.style.display = 'none'
+  }
+}
+
+async function loadMarket() {
+  const [{ data: stocks }, { data: holds }] = await Promise.all([
+    sb.from('drink_stocks').select('*').order('order_count', { ascending: false }),
+    sb.from('stock_holdings').select('*').eq('user_id', CU.id).gt('shares', 0)
+  ])
+  document.getElementById('h-holds').textContent = holds?.length || 0
+  renderPortfolio(holds || [], stocks || [])
+  await renderTicker(stocks || [], holds || [])
+}
+
+function renderPortfolio(holds, stocks) {
+  const card = document.getElementById('port-card')
+  if (!holds.length) { card.style.display = 'none'; return }
+  card.style.display = 'block'
+  document.getElementById('port-list').innerHTML = holds.map(h => {
+    const s = stocks.find(x => x.drink_name === h.drink_name)
+    const price = s?.price || h.avg_buy_price
+    const val = Math.round(price * 10 * h.shares)
+    const pnl = Math.round((price - h.avg_buy_price) * 10 * h.shares)
+    const tickChange = s ? Math.round((s.price - s.prev_price)*10*h.shares) : 0
+    return `<div class="port-item">
+      <div style="flex:1;min-width:0">
+        <div class="port-name">${h.drink_name}</div>
+        <div style="font-size:11px;color:var(--t3);margin-top:1px">${h.shares} shares @ ${h.avg_buy_price.toFixed(1)}</div>
+      </div>
+      <div class="port-detail">
+        <div class="port-val">${val.toLocaleString()} coins</div>
+        <div style="display:flex;gap:8px;margin-top:2px">
+          <div style="font-size:11px;color:${pnl>=0?'var(--gr2)':'var(--re2)'}">Total: ${pnl>=0?'+':''}${pnl}</div>
+          <div style="font-size:11px;color:${tickChange>=0?'var(--gr2)':'var(--re2)'}">Tick: ${tickChange>=0?'+':''}${tickChange}</div>
+        </div>
+      </div>
+      <button class="t-btn sell-btn" onclick="sellStock('${h.drink_name}',${h.shares},${price})">Sell</button>
+    </div>`
+  }).join('')
+}
+
+
+// ── NAV ───────────────────────────────────────────────────────────────────
+async function refreshCoins() {
+  if (!CU) return
+  const { data: p } = await sb.from('profiles').select('coins,total_realized_pnl').eq('id', CU.id).single()
+  if (p) { updCoins(p.coins); if(prof) prof.total_realized_pnl = p.total_realized_pnl||0 }
+}
+
+async function goPage(id) {
+  document.querySelectorAll('.pg').forEach(p => p.classList.remove('on'))
+  document.querySelectorAll('.bni').forEach(b => b.classList.remove('on'))
+  document.getElementById('pg-' + id).classList.add('on')
+  const idx = { home:0, groups:1, casino:2, invite:3 }
+  document.querySelectorAll('.bni')[idx[id]]?.classList.add('on')
+  await refreshCoins()
+  if (id === 'home') loadMarket()
+  if (id === 'groups') loadGroups()
+  if (id === 'invite') loadInvite()
+  if (id === 'casino') { setTimeout(initPlinko, 80); initMinesGrid() }
+}
+
+function showCreateGroup() { openModal('modal-create-group') }
+function openModal(id) { document.getElementById(id)?.classList.add('show') }
+function closeModal(id) { document.getElementById(id)?.classList.remove('show') }
+
+
+async function renderTicker(stocks, holds) {
+  if (!stocks.length) return
+
+  // Fetch user's fantasy drafted drinks across all groups
+  let fanMems = []
+  if (CU) {
+    const { data } = await sb.from('group_members')
+      .select('drafted_drink, group_id, groups(name)')
+      .eq('user_id', CU.id)
+      .not('drafted_drink', 'is', null)
+    fanMems = data || []
+  }
+  const myFantasyDrinks = {}
+  fanMems.forEach(m => { if(m.drafted_drink) myFantasyDrinks[m.drafted_drink] = m.groups?.name || 'Group' })
+
+  // Compute portfolio metrics
+  let totalVal = 0, totalCost = 0, dailyPnl = 0
+  holds.forEach(h => {
+    const s = stocks.find(x=>x.drink_name===h.drink_name)
+    const curPrice = s?.price || h.avg_buy_price
+    const openPrice = s?.open_price || curPrice
+    totalVal += Math.round(curPrice*10*h.shares)
+    totalCost += Math.round(h.avg_buy_price*10*h.shares)
+    dailyPnl += Math.round((curPrice - openPrice)*10*h.shares)
+  })
+  const unrealized = totalVal - totalCost
+  const allTimePnl = (prof?.total_realized_pnl||0) + unrealized
+  const dEl = document.getElementById('h-daily-pnl')
+  const aEl = document.getElementById('h-alltime-pnl')
+  const pEl = document.getElementById('h-port-val')
+  const uEl = document.getElementById('h-unrealized')
+  if (dEl) { dEl.textContent=(dailyPnl>=0?'+':'')+dailyPnl; dEl.style.color=dailyPnl>=0?'var(--gr2)':'var(--re2)' }
+  if (aEl) { aEl.textContent=(allTimePnl>=0?'+':'')+allTimePnl; aEl.style.color=allTimePnl>=0?'var(--gr2)':'var(--re2)' }
+  if (pEl) pEl.textContent = totalVal.toLocaleString()
+  if (uEl) { uEl.textContent=(unrealized>=0?'+':'')+unrealized; uEl.style.color=unrealized>=0?'var(--gr2)':'var(--re2)' }
+  document.getElementById('h-holds').textContent = holds.length
+  const summaryEl = document.getElementById('mkt-summary')
+  if (summaryEl) summaryEl.style.display = 'none'
+
+  document.getElementById('ticker-list').innerHTML = stocks.map(s => {
+    const d = s.price - s.prev_price, up = d > 0.05, dn = d < -0.05
+    const held = holds.find(h=>h.drink_name===s.drink_name)
+    const isMyFantasy = myFantasyDrinks[s.drink_name]
+    const heldPnl = held ? Math.round((s.price-held.avg_buy_price)*10*held.shares) : null
+    return `<div class="ticker-item" style="${isMyFantasy?'border-left:2px solid var(--pu);padding-left:6px;margin-left:-6px':''}">
+      <span style="font-size:13px;color:${up?'var(--gr2)':dn?'var(--re2)':'var(--t3)'};flex-shrink:0;width:14px">${up?'▲':dn?'▼':'—'}</span>
+      <div style="flex:1;min-width:0">
+        <div class="t-name" style="display:flex;align-items:center;gap:6px">
+          ${s.drink_name}
+          ${isMyFantasy?`<span style="font-size:9px;background:var(--pud);color:var(--pu2);border-radius:4px;padding:1px 5px;font-weight:600">DRAFT</span>`:''}
+        </div>
+        ${held?`<div style="font-size:10px;color:${heldPnl>=0?'var(--gr2)':'var(--re2)'};margin-top:1px">${held.shares} shares · P&L ${heldPnl>=0?'+':''}${heldPnl}</div>`:''}
+      </div>
+      <div style="text-align:right;margin-right:6px">
+        <div class="t-chg ${up?'up':dn?'dn':'flat'}" style="font-size:11px">${d>=0?'+':''}${d.toFixed(1)}</div>
+        <div class="t-price">${s.price.toFixed(1)}</div>
+      </div>
+      <button class="t-btn buy-btn" onclick="buyStock('${s.drink_name}',${s.price})">Buy</button>
+    </div>`
+  }).join('')
+}
+
+async function buyStock(name, price) {
+  const cost = Math.round(price * 10)
+  if (coins < cost) { toast('Not enough coins!', true); return }
+  const nc = coins - cost
+  await sb.from('profiles').update({ coins: nc }).eq('id', CU.id)
+  const { data: ex } = await sb.from('stock_holdings').select('*').eq('user_id', CU.id).eq('drink_name', name).single()
+  if (ex) await sb.from('stock_holdings').update({ shares: ex.shares+1, avg_buy_price: ((ex.avg_buy_price*ex.shares)+price)/(ex.shares+1) }).eq('id', ex.id)
+  else await sb.from('stock_holdings').insert({ user_id: CU.id, drink_name: name, shares: 1, avg_buy_price: price })
+  updCoins(nc); toast(`Bought 1 share of ${name} for ${cost} coins!`); onSharesBought(name); loadMarket()
+}
+
+async function sellStock(name, shares, price) {
+  const gain = Math.round(price * 10 * shares), nc = coins + gain
+  // Get avg buy price to calculate realized P&L
+  const { data: h } = await sb.from('stock_holdings').select('avg_buy_price').eq('user_id', CU.id).eq('drink_name', name).single()
+  const cost = h ? Math.round(h.avg_buy_price * 10 * shares) : gain
+  const realized = gain - cost
+  stockPnl.realized += realized
+  await sb.from('profiles').update({ coins: nc, total_realized_pnl: (prof?.total_realized_pnl||0) + realized }).eq('id', CU.id)
+  if (prof) prof.total_realized_pnl = (prof.total_realized_pnl||0) + realized
+  await sb.from('stock_holdings').update({ shares: 0 }).eq('user_id', CU.id).eq('drink_name', name)
+  updCoins(nc)
+  toast(`Sold for +${gain} coins! P&L: ${realized>=0?'+':''}${realized}`)
+  onSharesSold(name, shares)
+  loadMarket()
+}
+
+async function sellAll() {
+  const { data: holds } = await sb.from('stock_holdings').select('*,drink_stocks(price)').eq('user_id', CU.id).gt('shares', 0)
+  if (!holds?.length) return
+  let total = 0
+  for (const h of holds) {
+    const price = h.drink_stocks?.price || h.avg_buy_price
+    total += Math.round(price * 10 * h.shares)
+    await sb.from('stock_holdings').update({ shares: 0 }).eq('id', h.id)
+  }
+  const nc = coins + total
+  await sb.from('profiles').update({ coins: nc }).eq('id', CU.id)
+  updCoins(nc); toast(`Sold all holdings for +${total} coins!`); loadMarket()
+}
+
+// ── GROUPS ────────────────────────────────────────────────────────────────
+
+async function sellStock(name, shares, price) {
+  const { data: h } = await sb.from('stock_holdings').select('avg_buy_price').eq('user_id', CU.id).eq('drink_name', name).single()
+  const cost = h ? Math.round(h.avg_buy_price * 10 * shares) : 0
+  const gain = Math.round(price * 10 * shares)
+  const realized = gain - cost
+  const nc = coins + gain
+  if (prof) prof.total_realized_pnl = (prof.total_realized_pnl||0) + realized
+  await sb.from('profiles').update({ coins: nc, total_realized_pnl: prof?.total_realized_pnl||0 }).eq('id', CU.id)
+  await sb.from('stock_holdings').update({ shares: 0 }).eq('user_id', CU.id).eq('drink_name', name)
+  updCoins(nc)
+  toast('Sold for +' + gain + ' coins  (P&L: ' + (realized>=0?'+':'') + realized + ')')
+  onSharesSold(name, shares)
+  loadMarket()
+}
+
+async function sellAll() {
+  const { data: holds } = await sb.from('stock_holdings').select('*').eq('user_id', CU.id).gt('shares', 0)
+  if (!holds?.length) return
+  let total = 0
+  for (const h of holds) {
+    const { data: s } = await sb.from('drink_stocks').select('price').eq('drink_name', h.drink_name).single()
+    const p = s?.price || h.avg_buy_price
+    total += Math.round(p * 10 * h.shares)
+    await sb.from('stock_holdings').update({ shares: 0 }).eq('id', h.id)
+  }
+  const nc = coins + total
+  await sb.from('profiles').update({ coins: nc }).eq('id', CU.id)
+  updCoins(nc); toast('Sold all for +' + total + ' coins!'); loadMarket()
+}
+
+function checkMarketHours() {
+  const h = new Date().getHours(), open = h >= 17 || h < 3
+  const b = document.getElementById('mkt-banner'), t = document.getElementById('mkt-status-text')
+  const badge = document.getElementById('mkt-live-badge')
+  if (open) {
+    b.className = 'mkt-banner mb-open'; t.textContent = 'Market open — 5pm to 3am'
+    if (badge) badge.style.display = ''
+  } else {
+    b.className = 'mkt-banner mb-ah'; t.textContent = 'After hours — orders queue for 5pm'
+    if (badge) badge.style.display = 'none'
+  }
+}
+
+
+// ── GROUPS ────────────────────────────────────────────────────────────────
+let curGroup = null, curGTab = 'home', paceInterval = null, betSelections = {}
+let paceDuration = 30
+
+function setPaceDur(min, el) {
+  paceDuration = min
+  document.querySelectorAll('#pace-dur-chips .wchip').forEach(c=>c.classList.remove('on'))
+  el.classList.add('on')
+}
+
+async function loadGroups() {
+  const { data: gm } = await sb.from('group_members')
+    .select('group_id, groups(id,name,invite_code,is_fantasy,created_by,created_at)')
+    .eq('user_id', CU.id)
+  if (!gm?.length) {
+    document.getElementById('grp-list').innerHTML = '<div class="empty"><div class="empty-txt">No groups yet</div><div class="empty-sub">Create one or join below</div></div>'
+    return
+  }
+  const gids = gm.map(r=>r.group_id)
+  const { data: members } = await sb.from('group_members')
+    .select('*, profiles(display_name,avatar_url)')
+    .in('group_id', gids).order('season_drinks', {ascending:false})
+
+  document.getElementById('grp-list').innerHTML = gm.map(r => {
+    const g = r.groups
+    const mems = (members||[]).filter(m=>m.group_id===g.id)
+    const isCreator = g.created_by === CU.id
+    return '<div style="background:var(--card);border:1px solid var(--border2);border-radius:var(--r2);margin-bottom:10px;overflow:hidden;cursor:pointer" onclick="openGroup(\'' + g.id + '\',\'' + g.name.replace(/'/g,"\\'") + '\',\'' + g.invite_code + '\',' + (g.is_fantasy||false) + ',\'' + (g.created_by||'') + '\')">'
+      + '<div style="padding:14px 16px;display:flex;justify-content:space-between;align-items:center">'
+      + '<div><div style="font-size:16px;font-weight:600">' + g.name + '</div>'
+      + '<div style="font-size:12px;color:var(--t3);margin-top:2px">' + mems.length + ' members · Code: ' + g.invite_code + (isCreator?' · Manager':'') + '</div></div>'
+      + '<div style="display:flex;align-items:center;gap:6px">'
+      + (g.is_fantasy ? '<span class="badge badge-pu" style="font-size:10px">Fantasy</span>' : '')
+      + '<span style="color:var(--t3);font-size:18px">›</span></div></div></div>'
+  }).join('')
+}
+
+async function openGroup(id, name, code, isFantasy, creatorId) {
+  curGroup = { id, name, code, isFantasy, creatorId, isCreator: creatorId === CU.id }
+  document.getElementById('gd-name').textContent = name
+  document.getElementById('gd-meta').textContent = code + (curGroup.isCreator ? ' · Manager' : '')
+  document.getElementById('gd-badge').innerHTML = isFantasy ? '<span class="badge badge-pu">Fantasy</span>' : ''
+  document.getElementById('grp-detail').classList.add('show')
+  gTab('home')
+}
+
+function closeGroupDetail() {
+  if (chatChannel) { sb.removeChannel(chatChannel); chatChannel = null }
+  if (window._ouTimer) { clearInterval(window._ouTimer); window._ouTimer = null }
+  document.getElementById('grp-detail').classList.remove('show')
+  curGroup = null
+}
+
+function gTab(tab) {
+  curGTab = tab
+  document.querySelectorAll('.gst').forEach(b=>b.classList.remove('on'))
+  const tabs = ['home','play','fantasy','stats','chat']
+  document.querySelectorAll('.gst')[tabs.indexOf(tab)]?.classList.add('on')
+  loadGroupTab(tab)
+}
+
+async function loadGroupTab(tab) {
+  const el = document.getElementById('gd-content')
+  el.innerHTML = '<div class="empty" style="padding:30px"><div class="empty-txt">Loading...</div></div>'
+  const { data: members } = await sb.from('group_members')
+    .select('*, profiles(id,display_name,avatar_url,all_time_drinks,coins)')
+    .eq('group_id', curGroup.id).order('season_drinks', {ascending:false})
+  const mems = members || []
+  if (tab === 'home') await renderGroupHome(mems, el)
+  else if (tab === 'play') await renderPlay(mems, el)
+  else if (tab === 'fantasy') await renderFantasy(mems, el)
+  else if (tab === 'stats') renderStats(mems, el)
+  else if (tab === 'chat') await renderChat(el)
+}
+
+// ── GROUP HOME TAB ────────────────────────────────────────────────────────
+async function renderGroupHome(members, el) {
+  const { data: allLogs } = await sb.from('drink_logs').select('user_id,drink_name,logged_at').eq('group_id', curGroup.id)
+  const allTimeCounts = {}
+  ;(allLogs||[]).forEach(l => { allTimeCounts[l.user_id] = (allTimeCounts[l.user_id]||0)+1 })
+  const sorted = [...members].sort((a,b)=>(allTimeCounts[b.user_id]||0)-(allTimeCounts[a.user_id]||0))
+  const maxAll = Math.max(...sorted.map(m=>allTimeCounts[m.user_id]||0),1)
+  const hot = members.filter(m=>(m.streak||0)>=2).sort((a,b)=>b.streak-a.streak)
+  const { data: seasons } = await sb.from('fantasy_seasons').select('*').eq('group_id',curGroup.id).order('created_at',{ascending:false}).limit(1)
+  const activeSeason = seasons?.[0]
+  const getAlias = m => m.display_name_override||m.profiles?.display_name||'Unknown'
+
+  let html = ''
+
+  // Tonight's count + log button
+  html += '<div class="card" style="border-color:var(--pu)33">'
+  html += '<div class="card-hd" style="margin-bottom:10px"><div class="card-title">Tonight</div><span style="font-size:13px;font-weight:700;color:var(--pu2)">' + members.reduce((s,m)=>s+m.tonight_drinks,0) + ' total drinks</span></div>'
+  html += [...members].sort((a,b)=>b.tonight_drinks-a.tonight_drinks).map(m => {
+    const pct = Math.min(100, Math.round(m.tonight_drinks/Math.max(...members.map(x=>x.tonight_drinks),1)*100))
+    return '<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">' + avEl(getAlias(m),28) + '<div style="flex:1;min-width:0"><div style="font-size:13px;font-weight:500;display:flex;justify-content:space-between"><span>' + getAlias(m) + '</span><span style="color:var(--pu2);font-weight:700">' + m.tonight_drinks + '</span></div><div class="pb" style="margin-top:4px"><div class="pbf" style="width:'+pct+'%;background:var(--pu)"></div></div></div></div>'
+  }).join('')
+  html += '<button class="btn btn-pu" style="margin-top:8px" onclick="showLogDrink()">Log a drink</button>'
+  html += '</div>'
+
+  // Hot streaks
+  if (hot.length) {
+    html += '<div style="margin-bottom:12px"><div class="sec-hd" style="color:var(--re2)">On a Streak</div>'
+    html += hot.map(m => '<div class="streak-card">' + avEl(getAlias(m),30) + '<div style="flex:1"><div style="font-size:14px;font-weight:600">' + getAlias(m) + '</div><div style="font-size:12px;color:var(--t3)">' + m.streak + ' nights in a row</div></div>' + Array.from({length:Math.min(m.streak,5)}).map(()=>'<div style="width:7px;height:7px;border-radius:50%;background:var(--re2)"></div>').join('') + '<span class="hot-arrow">↑</span></div>').join('')
+    html += '</div>'
+  }
+
+  // All-time standings
+  html += '<div class="sec-hd">All-Time Standings</div>'
+  html += sorted.map((m,i) => {
+    const all = allTimeCounts[m.user_id]||0
+    return '<div class="alltime-row"><div class="lb-rank ' + (i===0?'rk1':i===1?'rk2':i===2?'rk3':'') + '">' + (i+1) + '</div>' + avEl(getAlias(m),28) + '<div style="flex:1;margin-left:8px"><div style="font-size:13px;font-weight:600">' + getAlias(m) + '</div><div class="pb" style="margin-top:4px;max-width:120px"><div class="pbf" style="width:'+Math.round(all/maxAll*100)+'%;background:var(--pu)"></div></div></div><div style="font-size:15px;font-weight:700;color:var(--am)">' + all + '</div></div>'
+  }).join('')
+
+  // Coin leaderboard
+  const byCoin = [...members].sort((a,b)=>(b.profiles?.coins||0)-(a.profiles?.coins||0))
+  html += '<div class="sec-hd" style="margin-top:16px">Coin Leaderboard</div>'
+  html += byCoin.map((m,i) => '<div class="alltime-row"><div class="lb-rank ' + (i===0?'rk1':i===1?'rk2':i===2?'rk3':'') + '">' + (i+1) + '</div>' + avEl(getAlias(m),28) + '<div style="flex:1;margin-left:8px;font-size:13px;font-weight:600">' + getAlias(m) + '</div><div style="font-size:14px;font-weight:700;color:var(--am)">' + (m.profiles?.coins||0).toLocaleString() + '</div></div>').join('')
+
+  // Fantasy standings if active
+  if (activeSeason) {
+    const fSorted = [...members].sort((a,b)=>(b.fantasy_points||0)-(a.fantasy_points||0))
+    html += '<div class="sec-hd" style="margin-top:16px">Fantasy — ' + activeSeason.name + '</div>'
+    html += fSorted.map((m,i) => '<div class="alltime-row"><div class="lb-rank ' + (i===0?'rk1':i===1?'rk2':i===2?'rk3':'') + '">' + (i+1) + '</div>' + avEl(getAlias(m),28) + '<div style="flex:1;margin-left:8px"><div style="font-size:13px;font-weight:600">' + getAlias(m) + '</div><div style="font-size:11px;color:var(--t3)">' + (m.drafted_drink||'No draft') + '</div></div><div style="font-size:15px;font-weight:700;color:var(--am)">' + (m.fantasy_points||0) + ' pts</div></div>').join('')
+  }
+
+  el.innerHTML = html
+}
+
+// ── UNIVERSAL DRINK LOG ───────────────────────────────────────────────────
+const BASE_DRINKS = ["Tito's Soda","Ranch Water","Espresso Martini","White Claw","Bud Light","Marg (frozen)","Vodka Soda","Whiskey Coke","Modelo","Coors Light"]
+
+function getGroupDrinks() {
+  if (!curGroup) return []
+  try { return JSON.parse(localStorage.getItem('custom_drinks_'+curGroup.id)||'[]') } catch { return [] }
+}
+
+function getAllDrinks() {
+  return [...BASE_DRINKS, ...getGroupDrinks()]
+}
+
+async function showLogDrink() {
+  if (!curGroup) return
+  const { data: mem } = await sb.from('group_members').select('drafted_drink').eq('user_id',CU.id).eq('group_id',curGroup.id).single()
+  const myDraft = mem?.drafted_drink
+  const { data: settings } = await sb.from('group_settings').select('drink_multipliers').eq('group_id',curGroup.id).single()
+  const multipliers = settings?.drink_multipliers ? JSON.parse(settings.drink_multipliers) : {}
+  const drinks = getAllDrinks()
+  document.getElementById('log-modal-title').textContent = 'What are you drinking?'
+  document.getElementById('log-drink-list').innerHTML = drinks.map(d => {
+    const isDraft = d === myDraft
+    const mult = multipliers[d] || 1
+    return '<div onclick="logDrinkUniversal(\'' + d.replace(/'/g,"\\'") + '\')" style="display:flex;align-items:center;gap:12px;padding:12px;background:' + (isDraft?'var(--pud)':'var(--bg3)') + ';border:1px solid ' + (isDraft?'var(--pu)':'var(--border)') + ';border-radius:10px;margin-bottom:6px;cursor:pointer">'
+      + '<div style="flex:1"><div style="font-size:14px;font-weight:600">' + d + '</div>'
+      + '<div style="font-size:11px;color:var(--t3);margin-top:2px">'
+      + (isDraft ? 'YOUR DRAFT — +' + Math.round(8*mult) + ' fantasy pts' : '+2 fantasy pts')
+      + (mult>1 ? ' · ' + mult + 'x multiplier' : '') + '</div></div>'
+      + (isDraft ? '<span class="badge badge-pu">Draft</span>' : '') + '</div>'
+  }).join('') + '<div onclick="logDrinkUniversal(\'other\')" style="display:flex;align-items:center;gap:12px;padding:12px;background:var(--bg3);border:1px solid var(--border);border-radius:10px;margin-bottom:6px;cursor:pointer"><div style="flex:1"><div style="font-size:14px;font-weight:600">Other drink</div><div style="font-size:11px;color:var(--t3)">+2 fantasy pts</div></div></div>'
+  openModal('modal-log-drink')
+}
+
+async function logDrinkUniversal(drinkName) {
+  closeModal('modal-log-drink')
+  if (!curGroup || !CU) return
+
+  // Get member data
+  const { data: mem } = await sb.from('group_members').select('*').eq('user_id',CU.id).eq('group_id',curGroup.id).single()
+  if (!mem) return
+
+  // Get settings for multiplier
+  const { data: settings } = await sb.from('group_settings').select('drink_multipliers').eq('group_id',curGroup.id).single()
+  const multipliers = settings?.drink_multipliers ? JSON.parse(settings.drink_multipliers) : {}
+
+  // Insert universal drink log
+  await sb.from('drink_logs').insert({ user_id: CU.id, group_id: curGroup.id, drink_name: drinkName, verified: false, logged_at: new Date().toISOString() })
+
+  // Calculate fantasy points
+  const isDrafted = drinkName === mem.drafted_drink
+  const mult = multipliers[drinkName] || 1
+  let pts = isDrafted ? Math.round(8 * mult) : Math.round(2 * mult)
+
+  // Check streak (did they log yesterday?)
+  const yesterday = new Date(); yesterday.setDate(yesterday.getDate()-1)
+  const yStr = yesterday.toISOString().split('T')[0]
+  const today = new Date().toISOString().split('T')[0]
+  const { data: yLogs } = await sb.from('drink_logs').select('id').eq('user_id',CU.id).eq('group_id',curGroup.id).gte('logged_at',yStr).lt('logged_at',today)
+  const newStreak = (yLogs||[]).length > 0 ? (mem.streak||0)+1 : 1
+  if (newStreak >= 3) pts = Math.round(pts * 1.5)
+
+  // Update group_members: tonight_drinks, season_drinks, fantasy_points, streak, coins_won
+  const newPts = (mem.fantasy_points||0) + pts
+  await sb.from('group_members').update({
+    tonight_drinks: (mem.tonight_drinks||0)+1,
+    season_drinks: (mem.season_drinks||0)+1,
+    fantasy_points: newPts,
+    streak: newStreak,
+    last_drink_date: today,
+    coins_won: (mem.coins_won||0) + pts
+  }).eq('user_id',CU.id).eq('group_id',curGroup.id)
+
+  // Give 5 coins per drink (scarce)
+  const nc = coins + 5
+  await sb.from('profiles').update({ coins: nc, all_time_drinks: ((prof?.all_time_drinks||0)+1) }).eq('id',CU.id)
+  updCoins(nc)
+
+  // Update stock price
+  if (drinkName !== 'other') onDrinkLogged(drinkName)
+
+  toast('+' + pts + ' fantasy pts' + (newStreak>=3?' — streak bonus!':'') + ' · +5 coins')
+
+  // Refresh current tab
+  gTab(curGTab)
+}
+
+// ── PLAY TAB (O/U + PACEMAKER) ────────────────────────────────────────────
+async function renderPlay(members, el) {
+  const { data: sessions } = await sb.from('pacemaker_sessions').select('*').eq('group_id',curGroup.id).eq('active',true).order('started_at',{ascending:false}).limit(1)
+  const session = sessions?.[0]
+  const total = members.reduce((s,m)=>s+m.tonight_drinks,0)
+  const me = members.find(m=>m.user_id===CU.id)
+  const getAlias = m => m.display_name_override||m.profiles?.display_name||'Unknown'
+
+  let html = ''
+
+  // ─ Pacemaker section ─
+  html += '<div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.1em;color:var(--t3);margin-bottom:10px">Pacemaker</div>'
+  if (session) {
+    const endTime = new Date(session.target_time).getTime()
+    const remaining = Math.max(0, Math.floor((endTime-Date.now())/1000))
+    const pct = Math.min(100,Math.round(total/session.target_drinks*100))
+    const maxD = Math.max(...members.map(m=>m.tonight_drinks),1)
+    html += '<div class="pac-timer" id="pace-display">' + fmtTime(remaining) + '</div>'
+    html += '<div class="pac-status">Round ends ' + new Date(session.target_time).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}) + '</div>'
+    html += '<div class="card"><div class="card-hd"><div class="card-title">Group Progress</div><span style="font-size:14px;font-weight:700">' + total + '/' + session.target_drinks + '</span></div>'
+    html += '<div style="display:flex;align-items:center;gap:10px"><div class="pb" style="height:8px"><div class="pbf" style="width:' + pct + '%;background:' + (pct>=80?'var(--gr)':pct>=50?'var(--pu)':'var(--re)') + '"></div></div><span style="font-size:13px;font-weight:600">' + pct + '%</span></div></div>'
+    // Individual bars with dynamic colors
+    html += '<div class="card"><div class="card-title" style="margin-bottom:10px">Individual Pace</div>'
+    const sorted = [...members].sort((a,b)=>b.tonight_drinks-a.tonight_drinks)
+    sorted.forEach((m,i) => {
+      const pct2 = Math.round(m.tonight_drinks/maxD*100)
+      const n = sorted.length
+      const color = i < n*0.33 ? 'var(--gr)' : i < n*0.66 ? 'var(--am)' : 'var(--re)'
+      html += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">' + avEl(getAlias(m),26) + '<div style="font-size:12px;color:var(--t2);width:70px">' + getAlias(m).split(' ')[0] + '</div><div class="pb"><div class="pbf" style="width:' + pct2 + '%;background:' + color + '"></div></div><div style="font-size:13px;font-weight:700;width:24px;text-align:right">' + m.tonight_drinks + '</div></div>'
+    })
+    html += '<button class="btn btn-re" style="margin-top:8px" onclick="endPaceSession(\'' + session.id + '\')">End Session</button></div>'
+    // Set timer
+    html += '<div id="pace-timer-data" data-end="' + session.target_time + '" data-id="' + session.id + '" style="display:none"></div>'
+  } else {
+    html += '<div class="card"><div class="empty" style="padding:16px"><div class="empty-txt">No active session</div><div class="empty-sub">Start a pacemaker round</div></div>'
+    html += '<button class="btn btn-pu" onclick="openModal(\'modal-pace-start\')">Start Pacemaker</button></div>'
+    html += '<div class="card"><div class="card-title" style="margin-bottom:10px">Tonight</div>'
+    html += members.map(m=>'<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">' + avEl(getAlias(m)) + '<div style="flex:1;margin-left:6px;font-size:14px;font-weight:500">' + getAlias(m) + '</div><div style="font-size:16px;font-weight:700">' + m.tonight_drinks + '</div></div>').join('')
+    html += '</div>'
+  }
+
+  // Log drink button
+  html += '<button class="btn btn-pu" onclick="showLogDrink()" style="margin-bottom:16px">Log a drink (+5 coins)</button>'
+
+  // ─ Over/Under section ─
+  html += '<div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.1em;color:var(--t3);margin-bottom:10px;margin-top:4px">Over / Under</div>'
+  html += '<div style="font-size:12px;color:var(--t3);margin-bottom:12px;line-height:1.6">Set your drink line for tonight. Others bet over or under. When you end your session, bets resolve against your actual count. 5hr cooldown before resetting.</div>'
+  const now = Date.now()
+  const { data: lines } = await sb.from('ou_lines').select('*').eq('group_id',curGroup.id).gte('expires_at',new Date().toISOString())
+  const { data: myBets } = await sb.from('bets').select('target_id').eq('bettor_id',CU.id).eq('group_id',curGroup.id).eq('resolved',false)
+  const bettedOn = new Set((myBets||[]).map(b=>b.target_id))
+  const myLine = (lines||[]).find(l=>l.user_id===CU.id)
+  const myRemaining = myLine ? Math.max(0,new Date(myLine.expires_at).getTime()-now) : 0
+
+  // My line card
+  html += '<div class="card" style="border-color:' + (myLine?'var(--pu)':'var(--border2)') + '44;margin-bottom:10px">'
+  html += '<div class="card-title" style="margin-bottom:10px">Your Line</div>'
+  if (myLine) {
+    const pctBar = Math.min(100,Math.round(myRemaining/72000000*100))
+    html += '<div style="display:flex;align-items:center;gap:12px;margin-bottom:10px">'
+    html += '<div style="flex:1"><div style="font-size:28px;font-weight:800;color:var(--pu2)">' + myLine.line + '</div><div style="font-size:12px;color:var(--t3)">drink line · ' + me?.tonight_drinks + ' logged</div></div>'
+    html += '<div style="text-align:right"><div style="font-size:11px;color:var(--t3)">Resets in</div><div style="font-size:18px;font-weight:700;color:var(--am)" id="my-ou-timer">' + fmtOUTime(Math.floor(myRemaining/1000)) + '</div></div></div>'
+    html += '<div style="height:4px;background:var(--bg3);border-radius:999px;overflow:hidden;margin-bottom:10px"><div style="height:100%;background:var(--pu);width:' + pctBar + '%;border-radius:999px" id="ou-bar"></div></div>'
+    html += '<div style="display:flex;gap:8px"><button class="btn btn-gr" style="margin-top:0;flex:1;padding:10px" onclick="endMySession(\'' + myLine.id + '\')">End Session</button><button class="btn btn-out" style="margin-top:0;padding:10px;width:auto" onclick="clearMyLine()">Clear</button></div>'
+    // Start timer for OU countdown
+    html += '<div id="ou-timer-data" data-end="' + myLine.expires_at + '" data-lineid="' + myLine.id + '" style="display:none"></div>'
+  } else {
+    html += '<div style="font-size:13px;color:var(--t3);margin-bottom:12px">How many drinks are you shooting for tonight?</div>'
+    html += '<div style="display:flex;gap:8px"><input id="my-line-inp" type="number" min="0" max="30" placeholder="e.g. 6" class="inp" style="width:90px;flex-shrink:0"><button class="btn btn-pu" style="margin:0;flex:1;padding:10px" onclick="setMyLine()">Set line (20hr)</button></div>'
+  }
+  html += '</div>'
+
+  // Others' lines
+  const others = members.filter(m=>m.user_id!==CU.id)
+  others.forEach((m,i) => {
+    const line = (lines||[]).find(l=>l.user_id===m.user_id)
+    const alreadyBet = bettedOn.has(m.user_id)
+    const alias = m.display_name_override||m.profiles?.display_name||'Unknown'
+    html += '<div class="card" style="margin-bottom:10px">'
+    html += '<div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">' + avEl(alias,36)
+    html += '<div style="flex:1"><div style="font-size:15px;font-weight:700">' + alias + '</div><div style="font-size:12px;color:var(--t3)">' + m.tonight_drinks + ' drinks tonight</div></div>'
+    if (line) {
+      const rem = Math.max(0,new Date(line.expires_at).getTime()-now)
+      html += '<div style="text-align:right"><div style="font-size:24px;font-weight:800">' + line.line + '</div><div style="font-size:10px;color:var(--t3)">' + fmtOUTime(Math.floor(rem/1000)) + '</div></div>'
+    }
+    html += '</div>'
+    if (!line) {
+      html += '<div style="background:var(--bg3);border-radius:10px;padding:10px;font-size:13px;color:var(--t3);text-align:center">No line set tonight</div>'
+    } else if (alreadyBet) {
+      html += '<div style="background:var(--bg3);border-radius:10px;padding:10px;font-size:13px;color:var(--t2);text-align:center">Bet placed — resolves when they end session</div>'
+    } else {
+      const rem = Math.max(0,new Date(line.expires_at).getTime()-now)
+      html += '<div style="height:3px;background:var(--bg3);border-radius:999px;margin-bottom:10px"><div style="height:100%;background:var(--am);width:' + Math.min(100,Math.round(rem/72000000*100)) + '%;border-radius:999px"></div></div>'
+      html += '<div class="odds-grid"><div class="odds-btn" id="ov-' + i + '" onclick="pickOd(' + i + ',\'over\',\'' + m.user_id + '\',' + line.line + ')"><div class="odds-val up">Over ' + line.line + '</div><div class="odds-lbl">+110</div></div>'
+      html += '<div class="odds-btn" id="un-' + i + '" onclick="pickOd(' + i + ',\'under\',\'' + m.user_id + '\',' + line.line + ')"><div class="odds-val dn">Under ' + line.line + '</div><div class="odds-lbl">-130</div></div></div>'
+      html += '<div class="wager-chips" id="ow-' + i + '" style="display:none;margin-top:10px"><div class="wchip on" onclick="setOW(' + i + ',25,this)">25</div><div class="wchip" onclick="setOW(' + i + ',50,this)">50</div><div class="wchip" onclick="setOW(' + i + ',100,this)">100</div><div class="wchip" onclick="setOW(' + i + ',200,this)">200</div></div>'
+      html += '<button class="btn btn-pu" id="ob-' + i + '" style="display:none;margin-top:10px" onclick="placeBet(' + i + ',\'' + m.user_id + '\',' + line.line + ',\'' + (line.id||'') + '\')">Place bet</button>'
+    }
+    html += '</div>'
+  })
+  el.innerHTML = html
+  // Start pacemaker timer if session active
+  const ptd = document.getElementById('pace-timer-data')
+  if (ptd) {
+    const endT = ptd.dataset.end, sessId = ptd.dataset.id
+    if(window._paceInt)clearInterval(window._paceInt)
+    window._paceInt = setInterval(()=>{
+      const r=Math.max(0,Math.floor((new Date(endT).getTime()-Date.now())/1000))
+      const e=document.getElementById('pace-display'); if(e)e.textContent=fmtTime(r)
+      if(r<=0){clearInterval(window._paceInt);endPaceSession(sessId)}
+    },1000)
+  }
+  // Start OU timer if line active
+  const otd = document.getElementById('ou-timer-data')
+  if (otd) {
+    const ouEnd = otd.dataset.end, lineId = otd.dataset.lineid
+    if(window._ouTimer)clearInterval(window._ouTimer)
+    window._ouTimer = setInterval(()=>{
+      const r=Math.max(0,new Date(ouEnd).getTime()-Date.now())
+      const e=document.getElementById('my-ou-timer'); if(e)e.textContent=fmtOUTime(Math.floor(r/1000))
+      const b=document.getElementById('ou-bar'); if(b)b.style.width=Math.min(100,Math.round(r/72000000*100))+'%'
+      if(r<=0){clearInterval(window._ouTimer);autoEndSession(lineId)}
+    },1000)
+  }
+}
+
+function fmtOUTime(s) {
+  if (s < 600) { // under 10 mins: show MM:SS
+    const m = Math.floor(s/60), sec = s%60
+    return (m<10?'0':'')+m+':'+(sec<10?'0':'')+sec
+  }
+  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60)
+  return h + 'h ' + m + 'm'
+}
+
+async function setMyLine() {
+  const val = parseFloat(document.getElementById('my-line-inp')?.value)
+  if (!val||val<0||val>30) { toast('Enter 0–30', true); return }
+  const expires = new Date(Date.now()+20*60*60*1000).toISOString()
+  const { error } = await sb.from('ou_lines').upsert({ user_id:CU.id, group_id:curGroup.id, line:val, expires_at:expires, session_active:true, final_count:null }, { onConflict:'user_id,group_id' })
+  if (error) { toast('Error: '+error.message, true); return }
+  toast('Line set to '+val+'!')
+  gTab('play')
+}
+
+async function clearMyLine() {
+  await sb.from('ou_lines').delete().eq('user_id',CU.id).eq('group_id',curGroup.id)
+  toast('Line cleared')
+  gTab('play')
+}
+
+async function endMySession(lineId) {
+  // Freeze current drink count and resolve bets
+  const { data: mem } = await sb.from('group_members').select('tonight_drinks').eq('user_id',CU.id).eq('group_id',curGroup.id).single()
+  const finalCount = mem?.tonight_drinks || 0
+  // Set expires to now + 5hr cooldown, mark session inactive
+  const cooldown = new Date(Date.now()+5*60*60*1000).toISOString()
+  await sb.from('ou_lines').update({ session_active:false, final_count:finalCount, expires_at:cooldown }).eq('id',lineId)
+  await resolveOUBets(CU.id, finalCount)
+  toast('Session ended! Final count: '+finalCount+'. Bets resolved.')
+  gTab('play')
+}
+
+async function autoEndSession(lineId) {
+  const { data: line } = await sb.from('ou_lines').select('*').eq('id',lineId).single()
+  if (!line||!line.session_active) return
+  const { data: mem } = await sb.from('group_members').select('tonight_drinks').eq('user_id',line.user_id).eq('group_id',curGroup?.id||line.group_id).single()
+  await sb.from('ou_lines').update({ session_active:false, final_count:mem?.tonight_drinks||0 }).eq('id',lineId)
+  await resolveOUBets(line.user_id, mem?.tonight_drinks||0)
+}
+
+async function resolveOUBets(targetUserId, finalCount) {
+  const { data: bets } = await sb.from('bets').select('*').eq('target_id',targetUserId).eq('group_id',curGroup?.id).eq('resolved',false)
+  for (const bet of (bets||[])) {
+    const win = (bet.direction==='over' && finalCount > bet.line) || (bet.direction==='under' && finalCount <= bet.line)
+    const pay = win ? Math.round(bet.wager*1.8) : 0
+    await sb.from('bets').update({ resolved:true, won:win, payout:pay }).eq('id',bet.id)
+    if (win) {
+      const { data: bp } = await sb.from('profiles').select('coins').eq('id',bet.bettor_id).single()
+      await sb.from('profiles').update({ coins:(bp?.coins||0)+pay }).eq('id',bet.bettor_id)
+    }
+  }
+}
+
+function pickOd(i,dir,uid,line) {
+  document.getElementById('ov-'+i)?.classList.toggle('pick-over', dir==='over')
+  document.getElementById('ov-'+i)?.classList.toggle('pick-under', false)
+  document.getElementById('un-'+i)?.classList.toggle('pick-under', dir==='under')
+  document.getElementById('un-'+i)?.classList.toggle('pick-over', false)
+  betSelections[i] = { dir, uid, line, wager:25 }
+  const ow = document.getElementById('ow-'+i); if(ow) ow.style.display='flex'
+  const ob = document.getElementById('ob-'+i); if(ob){ob.style.display='block';ob.textContent='Place bet · 25 coins'}
+}
+
+function setOW(i,w,el) {
+  betSelections[i].wager=w
+  document.querySelectorAll('#ow-'+i+' .wchip').forEach(c=>c.classList.remove('on')); el.classList.add('on')
+  const ob=document.getElementById('ob-'+i); if(ob)ob.textContent='Place bet · '+w+' coins'
+}
+
+async function placeBet(i,uid,line,lineId) {
+  const b=betSelections[i]; if(!b) return
+  if(coins<b.wager){toast('Not enough coins!',true);return}
+  const nc=coins-b.wager; updCoins(nc)
+  await sb.from('profiles').update({coins:nc}).eq('id',CU.id)
+  await sb.from('bets').insert({bettor_id:CU.id,target_id:uid,group_id:curGroup.id,direction:b.dir,line,wager:b.wager,resolved:false,ou_line_id:lineId})
+  toast('Bet placed — resolves when they end session')
+  const ob=document.getElementById('ob-'+i); if(ob){ob.textContent='Bet placed!';ob.disabled=true}
+  delete betSelections[i]
+}
+
+async function startPacemaker() {
+  const target = parseInt(document.getElementById('pace-target').value)
+  if (!target||target<1) { toast('Enter a target', true); return }
+  const targetTime = new Date(Date.now()+paceDuration*60*1000).toISOString()
+  await sb.from('pacemaker_sessions').insert({ group_id:curGroup.id, target_drinks:target, target_time:targetTime, active:true })
+  closeModal('modal-pace-start'); toast('Pacemaker started!'); gTab('play')
+}
+
+async function endPaceSession(id) {
+  await sb.from('pacemaker_sessions').update({active:false}).eq('id',id)
+  if(window._paceInt)clearInterval(window._paceInt)
+  toast('Session ended!'); gTab('play')
+}
+
+
+// ── SNAKE DRAFT FANTASY ───────────────────────────────────────────────────
+async function renderFantasy(members, el) {
+  const myMem = members.find(m=>m.user_id===CU.id)
+  const { data: seasons } = await sb.from('fantasy_seasons').select('*').eq('group_id',curGroup.id).order('created_at',{ascending:false})
+  const activeSeason = seasons?.[0]
+  const getAlias = m => m.display_name_override||m.profiles?.display_name||'Unknown'
+  const drinks = getAllDrinks()
+
+  // 7-day picker
+  const days = []
+  for (let i=1;i<=7;i++) {
+    const d=new Date(); d.setDate(d.getDate()+i)
+    const label = i===1?'Tomorrow':d.toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric'})
+    days.push({label,val:d.toISOString().split('T')[0]})
+  }
+
+  if (!activeSeason) {
+    let html = '<div style="background:var(--pud);border:1px solid var(--pu)33;border-radius:var(--r2);padding:14px;margin-bottom:14px">'
+    html += '<div style="font-size:13px;font-weight:600;color:var(--pu2);margin-bottom:4px">Snake Draft Fantasy</div>'
+    html += '<div style="font-size:12px;color:var(--pu2);opacity:.8;line-height:1.7">Each player drafts drinks in a snake order. Round 1 pick = most points. Logging your drafted drink scores points + boosts its stock price. Miss a night = -5 pts.</div></div>'
+    if (curGroup.isCreator) {
+      html += '<div class="card"><div class="card-title" style="margin-bottom:12px">Create Season</div>'
+      html += '<input class="inp" id="fn-name" placeholder="Season name" style="margin-bottom:10px">'
+      html += '<div style="font-size:11px;color:var(--t3);margin-bottom:6px;font-weight:600;text-transform:uppercase;letter-spacing:.06em">Rounds per player</div>'
+      html += '<div class="wager-chips" id="fn-rounds" style="margin-bottom:12px"><div class="wchip on" onclick="setRounds(1,this)">1</div><div class="wchip" onclick="setRounds(2,this)">2</div><div class="wchip" onclick="setRounds(3,this)">3</div></div>'
+      html += '<div style="font-size:11px;color:var(--t3);margin-bottom:8px;font-weight:600;text-transform:uppercase;letter-spacing:.06em">End date</div>'
+      html += '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:14px" id="day-chips">'
+      html += days.map((d,i)=>'<div class="wchip'+(i===6?' on':'')+'" onclick="selectDay(this)" data-val="'+d.val+'" style="border-radius:8px;padding:7px 13px">'+d.label+'</div>').join('')
+      html += '</div><button class="btn btn-am" onclick="createFantasySeason()">Create Season</button></div>'
+    } else {
+      html += '<div class="empty"><div class="empty-txt">No season yet</div><div class="empty-sub">Ask your group manager to create one</div></div>'
+    }
+    el.innerHTML = html
+    window._fanRounds = 1
+    return
+  }
+
+  // Parse draft order and picks
+  const draftOrder = activeSeason.draft_order ? JSON.parse(activeSeason.draft_order) : members.map(m=>m.user_id)
+  const rounds = activeSeason.rounds || 1
+  const picks = activeSeason.picks ? JSON.parse(activeSeason.picks) : {} // {userId: [drink1, drink2, drink3]}
+
+  // Build snake pick sequence
+  const pickSequence = []
+  for (let r=0;r<rounds;r++) {
+    const round = r%2===0 ? draftOrder : [...draftOrder].reverse()
+    round.forEach(uid => pickSequence.push({uid,round:r+1,pick:pickSequence.length+1}))
+  }
+
+  // Find current pick
+  const currentPickIdx = pickSequence.findIndex(p => !(picks[p.uid]||[]).length || (picks[p.uid]||[]).length < p.round)
+  // More accurately: find first slot not yet filled
+  const filledCount = Object.values(picks).reduce((s,arr)=>s+(arr?.length||0),0)
+  const nextPick = pickSequence[filledCount]
+  const draftComplete = filledCount >= pickSequence.length
+  const isMyTurn = nextPick?.uid === CU.id
+
+  const allDraftedDrinks = Object.values(picks).flat()
+  const availableDrinks = drinks.filter(d=>!allDraftedDrinks.includes(d))
+
+  let html = ''
+
+  // Season header
+  html += '<div class="card" style="background:linear-gradient(135deg,var(--pud),var(--bg3));border-color:var(--pu)44;margin-bottom:12px">'
+  html += '<div style="display:flex;justify-content:space-between;align-items:flex-start"><div><div style="font-size:17px;font-weight:700">' + activeSeason.name + '</div><div style="font-size:12px;color:var(--t3);margin-top:2px">' + rounds + ' round' + (rounds>1?'s':'') + ' · ends ' + activeSeason.end_date + '</div></div>'
+  html += '<span class="badge ' + (draftComplete?'badge-gr':'badge-am') + '">' + (draftComplete?'Active':'Drafting') + '</span></div></div>'
+
+  if (!draftComplete) {
+    // Draft board
+    html += '<div class="card" style="border-color:var(--am)44;background:var(--amd)11;margin-bottom:12px">'
+    html += '<div style="font-size:14px;font-weight:700;color:var(--am2);margin-bottom:12px">Draft Board</div>'
+
+    // Pick slots
+    pickSequence.forEach((p,i) => {
+      const m = members.find(x=>x.user_id===p.uid)
+      const alias = m ? getAlias(m) : 'Unknown'
+      const myPicks = picks[p.uid] || []
+      const thisPick = myPicks[p.round-1]
+      const isActive = i === filledCount
+      html += '<div class="draft-pick-slot' + (isActive?' active':thisPick?' done':'') + '">'
+      html += '<div class="pick-round">R' + p.round + ' #' + p.pick + '</div>'
+      html += avEl(alias,26)
+      html += '<div style="flex:1;margin-left:8px"><div style="font-size:13px;font-weight:600">' + alias + '</div></div>'
+      if (thisPick) html += '<span class="badge badge-gr" style="font-size:11px">' + thisPick + '</span>'
+      else if (isActive) html += '<span class="badge badge-am">Picking...</span>'
+      else html += '<span style="font-size:11px;color:var(--t3)">Waiting</span>'
+      html += '</div>'
+    })
+
+    if (isMyTurn) {
+      html += '<div style="font-size:13px;font-weight:600;color:var(--am2);margin-top:12px;margin-bottom:10px">Round ' + (nextPick.round) + ' — Your pick:</div>'
+      html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">'
+      availableDrinks.forEach(d => {
+        const scoringPts = nextPick.round === 1 ? 8 : nextPick.round === 2 ? 5 : 3
+        html += '<button onclick="makeDraftPick(\'' + d.replace(/'/g,"\\'") + '\',\'' + activeSeason.id + '\')" style="padding:10px;background:var(--bg3);border:1px solid var(--border2);border-radius:10px;cursor:pointer;font-size:13px;font-weight:500;color:var(--t1);font-family:inherit;text-align:left;transition:all .2s" onmouseover="this.style.borderColor=\'var(--am)\'" onmouseout="this.style.borderColor=\'var(--border2)\'">' + d + '<div style="font-size:10px;color:var(--t3);margin-top:3px">+' + scoringPts + ' pts/drink</div></button>'
+      })
+      html += '</div>'
+    }
+    html += '</div>'
+  }
+
+  // Standings with picks breakdown
+  html += '<div class="sec-hd">Season Standings</div>'
+  members.sort((a,b)=>(b.fantasy_points||0)-(a.fantasy_points||0)).forEach((m,i) => {
+    const myPicks = picks[m.user_id] || []
+    html += '<div class="card" style="margin-bottom:8px"><div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">'
+    html += '<div class="lb-rank ' + (i===0?'rk1':i===1?'rk2':i===2?'rk3':'') + '">' + (i+1) + '</div>'
+    html += avEl(getAlias(m),34)
+    html += '<div style="flex:1;margin-left:6px"><div style="font-size:15px;font-weight:700">' + getAlias(m) + '</div>'
+    if (myPicks.length) html += '<div style="font-size:11px;color:var(--t3)">' + myPicks.join(' · ') + '</div>'
+    html += '</div><div style="text-align:right"><div style="font-size:20px;font-weight:800;color:var(--am)">' + (m.fantasy_points||0) + '</div><div style="font-size:10px;color:var(--t3)">pts</div></div></div>'
+    // Scoring breakdown
+    if (myPicks.length) {
+      html += '<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px">'
+      html += '<div style="background:var(--bg3);border-radius:8px;padding:8px;text-align:center"><div style="font-size:11px;color:var(--t3)">Draft pts</div><div style="font-size:15px;font-weight:700;color:var(--gr2)">' + Math.round((m.fantasy_points||0)*0.6) + '</div></div>'
+      html += '<div style="background:var(--bg3);border-radius:8px;padding:8px;text-align:center"><div style="font-size:11px;color:var(--t3)">Other pts</div><div style="font-size:15px;font-weight:700;color:var(--pu2)">' + Math.round((m.fantasy_points||0)*0.3) + '</div></div>'
+      html += '<div style="background:var(--bg3);border-radius:8px;padding:8px;text-align:center"><div style="font-size:11px;color:var(--t3)">Streak</div><div style="font-size:15px;font-weight:700;color:' + ((m.streak||0)>=3?'var(--re2)':'var(--t2)') + '">' + (m.streak||0) + (m.streak>=3?' ↑':'') + '</div></div>'
+      html += '</div>'
+    }
+    html += '</div>'
+  })
+
+  // Scoring rules
+  html += '<div style="background:var(--bg3);border-radius:10px;padding:12px;margin-top:4px;font-size:13px;display:flex;flex-direction:column;gap:5px">'
+  html += '<div style="font-size:11px;color:var(--t3);font-weight:600;margin-bottom:4px">SCORING</div>'
+  const rules = [['R1 drafted drink','+8 pts','var(--gr2)'],['R2 drafted drink','+5 pts','var(--gr2)'],['R3 drafted drink','+3 pts','var(--gr2)'],['Any other drink','+2 pts','var(--t1)'],['Verified drink','+3 bonus','var(--am)'],['3+ night streak','×1.5','var(--pu2)'],['Miss a night','-5 pts','var(--re2)']]
+  rules.forEach(([l,v,c])=>{html+='<div style="display:flex;justify-content:space-between"><span style="color:var(--t2)">'+l+'</span><span style="font-weight:700;color:'+c+'">'+v+'</span></div>'})
+  html += '</div>'
+
+  el.innerHTML = html
+}
+
+let _fanRounds = 1
+function setRounds(n,el) { _fanRounds=n; document.querySelectorAll('#fn-rounds .wchip').forEach(c=>c.classList.remove('on')); el.classList.add('on') }
+function selectDay(el) { document.querySelectorAll('#day-chips .wchip').forEach(c=>c.classList.remove('on')); el.classList.add('on') }
+
+async function createFantasySeason() {
+  const name = document.getElementById('fn-name')?.value.trim()
+  if (!name) { toast('Enter a season name', true); return }
+  const selected = document.querySelector('#day-chips .wchip.on')
+  const end = selected?.dataset.val
+  if (!end) { toast('Select end date', true); return }
+  // Create random draft order
+  const { data: mems } = await sb.from('group_members').select('user_id').eq('group_id',curGroup.id)
+  let order = (mems||[]).map(m=>m.user_id)
+  for(let i=order.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[order[i],order[j]]=[order[j],order[i]]}
+  await sb.from('groups').update({is_fantasy:true}).eq('id',curGroup.id)
+  const { error } = await sb.from('fantasy_seasons').insert({ group_id:curGroup.id, name, start_date:new Date().toISOString().split('T')[0], end_date:end, draft_order:JSON.stringify(order), rounds:_fanRounds, picks:'{}' })
+  if (error) { toast('Error: '+error.message, true); return }
+  toast('Season created! Draft is open!'); gTab('fantasy')
+}
+
+async function makeDraftPick(drink, seasonId) {
+  if (!confirm('Pick ' + drink + '? You cannot change this round pick!')) return
+  const { data: season } = await sb.from('fantasy_seasons').select('*').eq('id',seasonId).single()
+  const picks = season.picks ? JSON.parse(season.picks) : {}
+  if (!picks[CU.id]) picks[CU.id] = []
+  picks[CU.id].push(drink)
+  // Set primary drafted_drink as round 1 pick
+  if (picks[CU.id].length === 1) {
+    await sb.from('group_members').update({drafted_drink:drink}).eq('user_id',CU.id).eq('group_id',curGroup.id)
+  }
+  await sb.from('fantasy_seasons').update({picks:JSON.stringify(picks)}).eq('id',seasonId)
+  toast('Picked ' + drink + '!'); gTab('fantasy')
+}
+
+// ── STATS TAB ─────────────────────────────────────────────────────────────
+function renderStats(members, el) {
+  if (!members.length) { el.innerHTML = '<div class="empty"><div class="empty-txt">No data yet</div></div>'; return }
+  const bySeason = [...members].sort((a,b)=>b.season_drinks-a.season_drinks)
+  const byFantasy = [...members].sort((a,b)=>(b.fantasy_points||0)-(a.fantasy_points||0))
+  const byCoins = [...members].sort((a,b)=>(b.profiles?.coins||0)-(a.profiles?.coins||0))
+  const maxSeason = Math.max(...members.map(m=>m.season_drinks),1)
+  const maxFantasy = Math.max(...members.map(m=>m.fantasy_points||0),1)
+  const getAlias = m => m.display_name_override||m.profiles?.display_name||'Unknown'
+
+  let html = '<div class="sec-hd">Season Leaderboard</div>'
+  html += bySeason.map((m,i)=>'<div class="lb-row"><div class="lb-rank '+(i===0?'rk1':i===1?'rk2':i===2?'rk3':'')+'">'+( i+1)+'</div>'+avEl(getAlias(m))+'<div class="lb-info" style="margin-left:8px"><div class="lb-name">'+getAlias(m)+'</div><div class="lb-sub">'+m.tonight_drinks+' tonight · '+( m.streak||0)+'d streak</div></div><div class="lb-val">'+m.season_drinks+' drinks</div></div>').join('')
+
+  html += '<div class="sec-hd" style="margin-top:16px">Fantasy Points</div>'
+  html += byFantasy.map((m,i)=>'<div class="lb-row"><div class="lb-rank '+(i===0?'rk1':i===1?'rk2':i===2?'rk3':'')+'">'+( i+1)+'</div>'+avEl(getAlias(m))+'<div class="lb-info" style="margin-left:8px"><div class="lb-name">'+getAlias(m)+'</div><div class="lb-sub">'+(m.drafted_drink||'No draft')+'</div></div><div class="lb-val">'+(m.fantasy_points||0)+' pts</div></div>').join('')
+
+  html += '<div class="sec-hd" style="margin-top:16px">Coin Leaders</div>'
+  html += byCoins.map((m,i)=>'<div class="lb-row"><div class="lb-rank '+(i===0?'rk1':i===1?'rk2':i===2?'rk3':'')+'">'+( i+1)+'</div>'+avEl(getAlias(m))+'<div class="lb-info" style="margin-left:8px"><div class="lb-name">'+getAlias(m)+'</div></div><div class="lb-val">'+(m.profiles?.coins||0).toLocaleString()+'</div></div>').join('')
+
+  html += '<div class="sec-hd" style="margin-top:16px">Season Drinks</div>'
+  html += bySeason.map(m=>'<div class="bar-row"><div class="bar-name">'+getAlias(m).split(' ')[0]+'</div><div class="pb"><div class="pbf" style="width:'+Math.round(m.season_drinks/maxSeason*100)+'%;background:var(--pu)"></div></div><div class="bar-val">'+m.season_drinks+'</div></div>').join('')
+
+  html += '<div class="sec-hd" style="margin-top:16px">Fantasy Points</div>'
+  html += byFantasy.map(m=>'<div class="bar-row"><div class="bar-name">'+getAlias(m).split(' ')[0]+'</div><div class="pb"><div class="pbf" style="width:'+Math.round((m.fantasy_points||0)/maxFantasy*100)+'%;background:var(--am)"></div></div><div class="bar-val">'+(m.fantasy_points||0)+'</div></div>').join('')
+
+  el.innerHTML = html
+}
+
+// ── GROUP SETTINGS ────────────────────────────────────────────────────────
+async function openGroupSettings() {
+  if (!curGroup) return
+  const { data: settings } = await sb.from('group_settings').select('*').eq('group_id', curGroup.id).single()
+  const multipliers = settings?.drink_multipliers ? JSON.parse(settings.drink_multipliers) : {}
+  const drinks = getAllDrinks()
+
+  let html = ''
+  html += '<div style="margin-bottom:14px"><div class="field-label" style="margin-bottom:6px">Group name</div>'
+  html += '<input class="inp" id="edit-group-name" value="' + curGroup.name + '" placeholder="Group name"></div>'
+  html += '<div style="margin-bottom:14px"><div class="field-label" style="margin-bottom:6px">Your alias in this group</div>'
+  html += '<input class="inp" id="edit-group-alias" placeholder="e.g. The Commissioner"></div>'
+  html += '<button class="btn btn-pu" style="margin-bottom:16px" onclick="saveGroupBasic()">Save</button>'
+  html += '<div class="divider"></div>'
+
+  if (curGroup.isCreator) {
+    html += '<div style="font-size:14px;font-weight:600;margin:12px 0 4px">Drink Multipliers</div>'
+    html += '<div style="font-size:12px;color:var(--t3);margin-bottom:12px;line-height:1.5">Set fantasy points multiplier per drink (1–5x). Higher = stronger drink = more points.</div>'
+    drinks.forEach(function(d) {
+      var val = multipliers[d] || 1
+      var safeId = d.replace(/[^a-z0-9]/gi, '_')
+      html += '<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">'
+      html += '<div style="flex:1;font-size:13px;font-weight:500">' + d + '</div>'
+      html += '<input type="number" min="1" max="5" step="0.5" value="' + val + '" '
+      html += 'style="width:60px;background:var(--bg3);border:1px solid var(--border2);border-radius:6px;padding:6px 8px;color:var(--t1);font-size:13px;font-family:inherit;outline:none" '
+      html += 'data-drink="' + d.replace(/"/g, '') + '" class="mult-inp">x</div>'
+    })
+    html += '<button class="btn btn-am" style="margin-top:8px" onclick="saveMultipliers()">Save multipliers</button>'
+    html += '<div class="divider"></div>'
+    html += '<div style="font-size:14px;font-weight:600;margin:12px 0 8px">Custom Group Drinks</div>'
+    html += '<div style="display:flex;gap:8px;margin-bottom:8px"><input class="inp" id="custom-drink-inp" placeholder="Add a drink"><button class="btn btn-pu btn-sm" style="margin:0;flex-shrink:0" onclick="addCustomDrink()">Add</button></div>'
+    var custom = getGroupDrinks()
+    if (custom.length) html += '<div style="font-size:12px;color:var(--t3)">' + custom.join(' · ') + '</div>'
+  }
+
+  html += '<div class="divider"></div>'
+  html += '<button class="btn btn-re" style="margin-top:8px" onclick="leaveGroup()">Leave Group</button>'
+
+  document.getElementById('group-settings-content').innerHTML = html
+  openModal('modal-group-settings')
+}
+
+
+async function leaveGroup() {
+  if (!confirm('Leave ' + curGroup.name + '? Your stats will be removed.')) return
+  await sb.from('group_members').delete().eq('user_id',CU.id).eq('group_id',curGroup.id)
+  closeGroupDetail(); toast('Left group'); loadGroups()
+}
+
+// ── GROUP ACTIONS ─────────────────────────────────────────────────────────
+async function createGroup() {
+  const name = document.getElementById('cg-name')?.value.trim()
+  if (!name) { toast('Enter a group name', true); return }
+  const { data: g, error } = await sb.from('groups').insert({name,created_by:CU.id}).select().single()
+  if (error||!g) { toast('Error creating group', true); return }
+  await sb.from('group_members').insert({group_id:g.id,user_id:CU.id,tonight_drinks:0,season_drinks:0,coins_won:0,fantasy_points:0})
+  await sb.from('group_settings').insert({group_id:g.id,drink_multipliers:'{}'})
+  document.getElementById('cg-name').value = ''
+  closeModal('modal-create-group')
+  toast('Created! Code: '+g.invite_code); loadGroups()
+}
+
+async function joinGroup() {
+  const code = document.getElementById('join-code-inp')?.value.trim().toUpperCase()
+  if (!code) return
+  const { data: g, error: ge } = await sb.from('groups').select('id,name').eq('invite_code',code).maybeSingle()
+  if (ge||!g) { toast('Group not found', true); return }
+  const { data: existing } = await sb.from('group_members').select('id').eq('group_id',g.id).eq('user_id',CU.id).maybeSingle()
+  if (existing) { toast('Already a member!', true); return }
+  const { error } = await sb.from('group_members').insert({group_id:g.id,user_id:CU.id,tonight_drinks:0,season_drinks:0,coins_won:0,fantasy_points:0})
+  if (error) { toast('Could not join: '+error.message, true); return }
+  document.getElementById('join-code-inp').value = ''
+  toast('Joined '+g.name+'! Stats start at 0.'); loadGroups()
+}
+
+
+// ── INVITE ────────────────────────────────────────────────────────────────
+async function loadInvite() {
+  if (!prof) return
+  document.getElementById('inv-code').textContent = prof.invite_code || 'RND-' + CU.id.slice(0,6).toUpperCase()
+  const { data: refs } = await sb.from('referrals').select('*, referred:referred_id(display_name)').eq('referrer_id', CU.id)
+  const total = (refs||[]).reduce((s,r)=>s+r.coins_awarded,0)
+  document.getElementById('ref-list').innerHTML = refs?.length
+    ? refs.map(r=>'<div style="display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--border)">'+avEl(r.referred?.display_name||'?')+'<div style="flex:1;margin-left:8px;font-size:14px;font-weight:500">'+(r.referred?.display_name||'Pending')+'</div><div style="color:var(--gr2);font-weight:700">+'+r.coins_awarded+'</div></div>').join('') + '<div style="text-align:center;padding:10px;font-size:13px;color:var(--t3)">Total earned: <span style="color:var(--gr2);font-weight:700">+'+total+' coins</span></div>'
+    : '<div class="empty"><div class="empty-txt">No referrals yet</div></div>'
+}
+
+function copyCode() {
+  const code = document.getElementById('inv-code').textContent
+  navigator.clipboard.writeText(code).then(()=>toast('Code copied!')).catch(()=>toast(code))
+}
+
+
+// ── HELPERS ───────────────────────────────────────────────────────────────
+const AVBG = ['#1a163d','#00302a','#3d0a0a','#3d2f00','#001f3d','#2a0a3d','#1a2a0a']
+const AVFG = ['#a29bfe','#55efc4','#ff7675','#ffeaa7','#74b9ff','#d29bfe','#a8e6a3']
+
+function avBg(n) { const i=(n||'?').charCodeAt(0)%AVBG.length; return {bg:AVBG[i],fg:AVFG[i]} }
+function ini(n) { return (n||'?').split(' ').map(w=>w[0]).join('').toUpperCase().slice(0,2) }
+
+function avEl(name, size=32, avatarUrl=null) {
+  if (avatarUrl) return '<div class="av" style="width:'+size+'px;height:'+size+'px;overflow:hidden;flex-shrink:0"><img src="'+avatarUrl+'" style="width:100%;height:100%;object-fit:cover;border-radius:50%"></div>'
+  const {bg,fg} = avBg(name||'?')
+  return '<div class="av" style="width:'+size+'px;height:'+size+'px;background:'+bg+';color:'+fg+';font-size:'+Math.round(size*.36)+'px;flex-shrink:0">'+ini(name||'?')+'</div>'
+}
+
+function fmtTime(s) { const m=Math.floor(s/60),sec=s%60; return (m<10?'0':'')+m+':'+(sec<10?'0':'')+sec }
+function escHtml(str) { return (str||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;') }
+
+// Boot
+sb.auth.onAuthStateChange(async(ev,sess)=>{ if(ev==='SIGNED_IN'&&sess?.user&&!CU) await bootApp(sess.user) })
+sb.auth.getSession().then(({data:{session}})=>{ if(session?.user) bootApp(session.user) })
+
+
+// ── MINES GAME ────────────────────────────────────────────────────────────
+let minesCount = 3, minesWager = 25, minesActive = false
+let minesBoard = [], minesRevealed = 0, minesMultiplier = 1.0, minePositions = new Set()
+
+function setMines(n,el) { if(minesActive)return; minesCount=n; document.querySelectorAll('#mines-count-chips .wchip').forEach(c=>c.classList.remove('on')); el.classList.add('on') }
+function setMinesWager(w,el) { if(minesActive)return; minesWager=w; document.querySelectorAll('#mines-wager-chips .wchip').forEach(c=>c.classList.remove('on')); el.classList.add('on'); document.getElementById('mines-start-btn').textContent='Start ('+w+' coins)' }
+
+function initMinesGrid() {
+  if (minesActive) return  // don't reset mid-game
+  minePositions = new Set()
+  resetMinesGrid()
+}
+
+async function startMines() {
+  if (coins < minesWager) { toast('Need '+minesWager+' coins!', true); return }
+
+  // Truly random mine placement using Fisher-Yates shuffle on all 25 positions
+  const positions = Array.from({length:25},(_,i)=>i)
+  for (let i=24;i>0;i--) {
+    const j = Math.floor(Math.random()*(i+1));
+    [positions[i],positions[j]] = [positions[j],positions[i]]
+  }
+  minePositions = new Set(positions.slice(0, minesCount))
+
+  minesActive = true
+  minesRevealed = 0
+  minesMultiplier = 1.0
+
+  // Deduct coins upfront
+  const nc = coins - minesWager; updCoins(nc)
+  await sb.from('profiles').update({coins:nc}).eq('id',CU.id)
+
+  // Reset grid completely - build fresh tiles
+  resetMinesGrid()
+
+  document.getElementById('mines-start-btn').style.display = 'none'
+  document.getElementById('mines-cashout-btn').style.display = 'block'
+  document.getElementById('mines-multiplier').style.display = 'block'
+  document.getElementById('mines-multiplier').textContent = '1.00x'
+  document.getElementById('mines-result').style.display = 'none'
+  document.querySelectorAll('#mines-count-chips .wchip,#mines-wager-chips .wchip').forEach(c=>c.style.opacity='0.4')
+}
+
+function resetMinesGrid() {
+  // Always rebuild grid from scratch — no revealed state carried over
+  const grid = document.getElementById('mines-grid')
+  if (!grid) return
+  grid.innerHTML = ''
+  for (let i=0;i<25;i++) {
+    const tile = document.createElement('div')
+    tile.className = 'mine-tile'
+    tile.dataset.idx = i
+    tile.textContent = '?'
+    tile.onclick = () => { if(minesActive) revealTile(i) }
+    grid.appendChild(tile)
+  }
+}
+
+function calcMinesMultiplier(revealed, totalMines) {
+  // Fair multiplier based on probability: reward = 1 / P(surviving revealed picks)
+  // P(safe pick k) = (25-totalMines-k) / (25-k)
+  // Product of all safe pick probabilities = survival probability
+  // Multiplier = (1/survival) * house_edge
+  // House edge: 0.96 (4% rake) — slightly generous to keep it fun
+  let survival = 1.0
+  for (let k=0;k<revealed;k++) {
+    survival *= (25 - totalMines - k) / (25 - k)
+  }
+  const fairMult = 1 / survival
+  return Math.max(1.0, parseFloat((fairMult * 0.96).toFixed(2)))
+}
+
+function revealTile(idx) {
+  if (!minesActive) return
+  const tiles = document.querySelectorAll('#mines-grid .mine-tile')
+  const tile = tiles[idx]
+  if (!tile || tile.classList.contains('revealed')) return
+
+  if (minePositions.has(idx)) {
+    // Hit a mine — show all mines, lock board
+    tile.classList.add('mine-hit','revealed')
+    tile.textContent = 'X'
+    minesActive = false
+    minePositions.forEach(pos => {
+      const t = tiles[pos]
+      if (t && pos !== idx) { t.classList.add('mine-show','revealed'); t.textContent = 'X' }
+    })
+    const res = document.getElementById('mines-result')
+    res.style.display = 'block'; res.className = 'result-banner res-lose'
+    res.textContent = 'Mine! Lost ' + minesWager + ' coins'
+    endMinesRound(false)
+  } else {
+    // Safe — reveal tile, grow multiplier
+    minesRevealed++
+    tile.classList.add('safe','revealed')
+    tile.textContent = minesRevealed
+    minesMultiplier = calcMinesMultiplier(minesRevealed, minesCount)
+    const multEl = document.getElementById('mines-multiplier')
+    if (multEl) multEl.textContent = minesMultiplier.toFixed(2) + 'x'
+    // Auto cashout if all safe tiles found
+    if (minesRevealed >= 25 - minesCount) cashoutMines()
+  }
+}
+
+async function cashoutMines() {
+  if (!minesActive) return
+  minesActive = false
+  const pay = Math.round(minesWager * minesMultiplier)
+  const nc = coins + pay; updCoins(nc)
+  await sb.from('profiles').update({coins:nc}).eq('id',CU.id)
+  const res = document.getElementById('mines-result')
+  res.style.display = 'block'; res.className = 'result-banner res-win'
+  res.textContent = minesMultiplier.toFixed(2) + 'x — Won ' + pay + ' coins!'
+  endMinesRound(true)
+}
+
+function endMinesRound(won) {
+  document.getElementById('mines-cashout-btn').style.display = 'none'
+  document.getElementById('mines-multiplier').style.display = 'none'
+  document.querySelectorAll('#mines-count-chips .wchip,#mines-wager-chips .wchip').forEach(c=>c.style.opacity='1')
+  const startBtn = document.getElementById('mines-start-btn')
+  // Show result for 2.5s, then wipe the board and show Play again
+  setTimeout(() => {
+    document.getElementById('mines-result').style.display = 'none'
+    // Full reset — new blank grid, no mines visible
+    minePositions = new Set()
+    resetMinesGrid()
+    if (startBtn) {
+      startBtn.style.display = 'block'
+      startBtn.textContent = 'Play again (' + minesWager + ' coins)'
+    }
+  }, 2500)
+}
+
+
+// ── PROFILE ───────────────────────────────────────────────────────────────
+function openProfileModal() {
+  if (!prof) return
+  const nameEl = document.getElementById('edit-display-name')
+  if (nameEl) nameEl.value = prof.display_name || ''
+  const initials = document.getElementById('profile-pic-initials')
+  if (initials) initials.textContent = (prof.display_name||'?').split(' ').map(w=>w[0]).join('').toUpperCase().slice(0,2)
+  if (prof.avatar_url) {
+    const img = document.getElementById('profile-pic-img')
+    if (img) { img.src = prof.avatar_url; img.style.display='block'; if(initials) initials.style.display='none' }
+  }
+  openModal('modal-profile')
+}
+
+function handleProfilePic(input) {
+  const file = input.files[0]; if (!file) return
+  const reader = new FileReader()
+  reader.onload = e => {
+    const img = document.getElementById('profile-pic-img')
+    const initials = document.getElementById('profile-pic-initials')
+    if (img) { img.src=e.target.result; img.style.display='block' }
+    if (initials) initials.style.display='none'
+    window._pendingProfilePic = e.target.result
+  }
+  reader.readAsDataURL(file)
+}
+
+async function saveProfile() {
+  const name = document.getElementById('edit-display-name')?.value.trim()
+  if (!name) { toast('Enter a name', true); return }
+  const updates = { display_name: name }
+  if (window._pendingProfilePic) updates.avatar_url = window._pendingProfilePic
+  await sb.from('profiles').update(updates).eq('id', CU.id)
+  prof = {...prof,...updates}
+  toast('Profile updated'); closeModal('modal-profile')
+  window._pendingProfilePic = null
+}
+
+
+// ── CHAT ──────────────────────────────────────────────────────────────────
+let chatChannel = null
+
+async function renderChat(el) {
+  if (!curGroup) return
+  el.innerHTML = '<div class="chat-wrap"><div class="chat-messages" id="chat-msgs"><div style="text-align:center;padding:20px;color:var(--t3);font-size:13px">Loading...</div></div><div style="padding:4px 0 6px;display:flex;justify-content:flex-end"><button onclick="showAddDrinkModal()" style="font-size:11px;color:var(--t3);background:none;border:1px solid var(--border);border-radius:6px;padding:3px 10px;cursor:pointer;font-family:inherit">+ Add group drink</button></div><div class="chat-input-row"><input class="chat-input" id="chat-inp" placeholder="Message..."><button class="chat-send" onclick="sendChat()">&#8593;</button></div></div>'
+  await loadChatMessages()
+  if (chatChannel) sb.removeChannel(chatChannel)
+  chatChannel = sb.channel('chat-'+curGroup.id)
+    .on('postgres_changes',{event:'INSERT',schema:'public',table:'group_messages',filter:'group_id=eq.'+curGroup.id}, payload=>appendChatMsg(payload.new))
+    .subscribe()
+  setTimeout(()=>{ const i=document.getElementById('chat-inp'); if(i){i.focus();i.addEventListener('keydown',e=>{if(e.key==='Enter')sendChat()})} },150)
+}
+
+async function loadChatMessages() {
+  const { data: msgs } = await sb.from('group_messages').select('*,profiles(display_name,avatar_url)').eq('group_id',curGroup.id).order('created_at',{ascending:true}).limit(60)
+  const { data: mems } = await sb.from('group_members').select('user_id,display_name_override').eq('group_id',curGroup.id)
+  const aliasMap={}, picMap={}
+  ;(mems||[]).forEach(m=>{ if(m.display_name_override)aliasMap[m.user_id]=m.display_name_override; if(m.profiles?.avatar_url)picMap[m.user_id]=m.profiles?.avatar_url })
+  const container = document.getElementById('chat-msgs')
+  if (!container) return
+  if (!msgs?.length) { container.innerHTML='<div style="text-align:center;padding:30px;color:var(--t3);font-size:13px">No messages yet. Say something!</div>'; return }
+  container.innerHTML = msgs.map(m=>renderChatMsg(m,aliasMap,picMap)).join('')
+  container.scrollTop = container.scrollHeight
+}
+
+function renderChatMsg(msg, aliasMap={}, picMap={}) {
+  const isMine = msg.user_id === CU.id
+  const name = aliasMap[msg.user_id] || msg.profiles?.display_name || 'Unknown'
+  const pic = picMap[msg.user_id] || msg.profiles?.avatar_url || null
+  const time = new Date(msg.created_at).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})
+  const avatarEl = pic
+    ? '<div class="av" style="width:28px;height:28px;overflow:hidden;flex-shrink:0"><img src="'+pic+'" style="width:100%;height:100%;object-fit:cover;border-radius:50%"></div>'
+    : avEl(name,28)
+  return '<div class="chat-msg '+(isMine?'mine':'')+'">'
+    +(isMine?'':avatarEl)
+    +'<div style="max-width:72%">'
+    +(isMine?'':'<div class="chat-sender">'+escHtml(name)+'</div>')
+    +'<div class="chat-bubble">'+escHtml(msg.message)+'</div>'
+    +'</div><div class="chat-time">'+time+'</div></div>'
+}
+
+function appendChatMsg(msg) {
+  const container = document.getElementById('chat-msgs')
+  if (!container) return
+  const div = document.createElement('div')
+  div.innerHTML = renderChatMsg(msg)
+  container.appendChild(div.firstChild)
+  container.scrollTop = container.scrollHeight
+}
+
+async function sendChat() {
+  const inp = document.getElementById('chat-inp')
+  if (!inp) return
+  const msg = inp.value.trim(); if (!msg) return
+  inp.value = ''
+  const { error } = await sb.from('group_messages').insert({group_id:curGroup.id,user_id:CU.id,message:msg})
+  if (error) { toast('Error: '+error.message,true); inp.value=msg }
+}
+
+function showAddDrinkModal() {
+  const name = prompt('Add a custom drink to this group:')
+  if (!name?.trim()) return
+  const existing = getGroupDrinks()
+  if (!existing.includes(name.trim())) {
+    existing.push(name.trim())
+    localStorage.setItem('custom_drinks_'+curGroup.id,JSON.stringify(existing))
+  }
+  toast(name.trim()+' added to group drinks!')
+}
+
+// ── MULTI-BALL PLINKO ────────────────────────────────────────────────────
+let plActiveBalls2 = [], plAnimRunning2 = false
+
+function initPlinko() {
+  const c = document.getElementById('plinko-canvas'); if (!c) return
+  c.width = c.parentElement.offsetWidth
+  const W = c.width, H = 240, ROWS = 8
+  const GAP = Math.floor((W - 48) / (ROWS + 1))
+  plPegs = []; plBkts = []
+  for (let r=0; r<ROWS; r++) {
+    const cols = r + 2
+    for (let col=0; col<cols; col++) plPegs.push({ x: W/2-(cols-1)/2*GAP+col*GAP, y: 32+r*22 })
+  }
+  const BC = ROWS + 1
+  for (let i=0; i<BC; i++) plBkts.push({ x: W/2-(BC-1)/2*GAP+i*GAP, mult: PLM[i]||0, col: PLC[i]||'#888' })
+  plActiveBalls2 = []
+  drawPlinko()
+  updatePlLabel()
+}
+
+function drawPlinko() {
+  const c = document.getElementById('plinko-canvas'); if (!c) return
+  const ctx = c.getContext('2d'), W = c.width, H = c.height
+  ctx.fillStyle = '#0e0e1a'; ctx.fillRect(0,0,W,H)
+  ctx.strokeStyle = '#1e1e3a'; ctx.lineWidth = 1
+  ctx.beginPath(); ctx.moveTo(22,0); ctx.lineTo(22,H-44); ctx.stroke()
+  ctx.beginPath(); ctx.moveTo(W-22,0); ctx.lineTo(W-22,H-44); ctx.stroke()
+  plPegs.forEach(p => { ctx.beginPath(); ctx.arc(p.x,p.y,4,0,Math.PI*2); ctx.fillStyle='#3d3580'; ctx.fill() })
+  plBkts.forEach(b => {
+    ctx.fillStyle = b.col+'20'; ctx.fillRect(b.x-13,H-40,26,28)
+    ctx.strokeStyle = b.col+'40'; ctx.lineWidth=1; ctx.strokeRect(b.x-13,H-40,26,28)
+    ctx.fillStyle = b.col; ctx.font='bold 9px sans-serif'; ctx.textAlign='center'
+    ctx.fillText(b.mult+'x', b.x, H-22)
+  })
+  plActiveBalls2.forEach(ball => {
+    const grad = ctx.createRadialGradient(ball.x-2,ball.y-2,1,ball.x,ball.y,8)
+    grad.addColorStop(0,'#c0b4ff'); grad.addColorStop(1,'#6c5ce7')
+    ctx.beginPath(); ctx.arc(ball.x,ball.y,5,0,Math.PI*2); ctx.fillStyle=grad; ctx.fill()
+  })
+}
+
+function computePlPath(W) {
+  const WALL_L = 24, WALL_R = W - 24
+  let tx = { x: W/2+(Math.random()-0.5)*6, y: 8, vx: (Math.random()-0.5)*0.3, vy: 0 } // tight start = center bias
+  const path = []
+  for (let i=0; i<240; i++) {
+    tx.vy += 0.22; tx.vx *= 0.997; tx.vx += (W/2-tx.x)*0.0003 // slight center gravity
+    tx.x += tx.vx * 0.85; tx.y += tx.vy * 0.85
+    plPegs.forEach(p => {
+      const dx=tx.x-p.x, dy=tx.y-p.y, d=Math.sqrt(dx*dx+dy*dy)
+      if (d < 10) {
+        const nx=dx/d, ny=dy/d, dot=tx.vx*nx+tx.vy*ny
+        tx.vx -= 2*dot*nx*0.82; tx.vy -= 2*dot*ny*0.82
+        tx.vx += (Math.random()-0.5)*0.5
+        tx.x = p.x+nx*10; tx.y = p.y+ny*10
+      }
+    })
+    if (tx.x < WALL_L) { tx.x = WALL_L; tx.vx = Math.abs(tx.vx)*0.65 }
+    if (tx.x > WALL_R) { tx.x = WALL_R; tx.vx = -Math.abs(tx.vx)*0.65 }
+    path.push({ x:tx.x, y:tx.y })
+    if (tx.y > 200) break
+  }
+  let slot=0, minD=9999
+  plBkts.forEach((b,i) => { const d=Math.abs(tx.x-b.x); if(d<minD){minD=d;slot=i} })
+  return { path, slot }
+}
+
+async function dropBall() {
+  if (plAnimRunning2) return
+  const total = plW * plBalls
+  if (coins < total) { toast('Need ' + total + ' coins!', true); return }
+  plAnimRunning2 = true
+  document.getElementById('pl-btn').disabled = true
+  document.getElementById('pl-result').style.display = 'none'
+  const W = document.getElementById('plinko-canvas').width
+  const ballData = Array.from({length: plBalls}, () => { const {path,slot} = computePlPath(W); return {path, slot, pi:0, done:false} })
+  const nc = coins - total; updCoins(nc)
+  sb.from('profiles').update({coins: nc}).eq('id', CU.id)
+  const tick = () => {
+    ballData.forEach(b => { if (!b.done) { b.pi++; if (b.pi >= b.path.length) b.done = true } })
+    plActiveBalls2 = ballData.filter(b=>!b.done).map(b=>b.path[Math.min(b.pi,b.path.length-1)])
+    drawPlinko()
+    if (!ballData.every(b=>b.done)) { requestAnimationFrame(tick); return }
+    let pay = 0
+    ballData.forEach(b => { pay += Math.round(plW * (PLM[b.slot]||0)) })
+    const nc2 = coins + pay; updCoins(nc2)
+    sb.from('profiles').update({coins: nc2}).eq('id', CU.id)
+    const res = document.getElementById('pl-result')
+    const profit = pay - total
+    res.style.display = 'block'
+    if (profit > 0) {
+      res.className = 'result-banner res-win'
+      res.textContent = 'Won ' + pay + ' coins  (+' + profit + ' profit)'
+      plStats.wins++; plStats.totalWon += profit
+    } else if (pay > 0) {
+      res.className = 'result-banner res-lose'
+      res.textContent = 'Got ' + pay + ' back  (−' + Math.abs(profit) + ' loss)'
+      plStats.losses++; plStats.totalLost += Math.abs(profit)
+    } else {
+      res.className = 'result-banner res-lose'
+      res.textContent = 'Lost ' + total + ' coins'
+      plStats.losses++; plStats.totalLost += total
+    }
+    // Update last result & all-time tracker
+    const lastEl = document.getElementById('pl-last')
+    const lastTxt = document.getElementById('pl-last-text')
+    const allTime = document.getElementById('pl-alltime')
+    if (lastEl) lastEl.style.display = 'flex'
+    if (lastTxt) lastTxt.textContent = 'Last: ' + (profit > 0 ? '+' + profit : profit === 0 ? '−'+total : profit) + ' coins'
+    if (lastTxt) lastTxt.style.color = profit > 0 ? 'var(--gr2)' : 'var(--re2)'
+    if (allTime) allTime.textContent = 'W/L: ' + plStats.wins + '/' + plStats.losses + '  |  Net: ' + (plStats.totalWon - plStats.totalLost)
+    plActiveBalls2 = []; drawPlinko()
+    document.getElementById('pl-btn').disabled = false; plAnimRunning2 = false
+    setTimeout(() => res.style.display = 'none', 3500)
+  }
+  requestAnimationFrame(tick)
+}
+
+function setPW(a,el){plW=a;document.querySelectorAll('#pl-chips .wchip').forEach(c=>c.classList.remove('on'));el.classList.add('on');updatePlLabel()}
+function setPB(n,el){plBalls=n;document.querySelectorAll('#pl-ball-chips .wchip').forEach(c=>c.classList.remove('on'));el.classList.add('on');updatePlLabel()}
+function updatePlLabel(){
+  const tot=plW*plBalls
+  const lbl=document.getElementById('pl-total-label'); if(lbl) lbl.textContent='Total wager: '+tot.toLocaleString()+' coins'
+  const btn=document.getElementById('pl-btn'); if(btn) btn.textContent='Drop '+plBalls+' Ball'+(plBalls>1?'s':'')+' ('+tot.toLocaleString()+' coins)'
+}
+
+function setSW(a,el){slW=a;document.querySelectorAll('#sl-chips .wchip').forEach(c=>c.classList.remove('on'));el.classList.add('on');const btn=document.getElementById('sl-btn');if(btn)btn.textContent='Spin ('+a+' coins)'}
+
+async function spinSlots(){
+  if(slRun)return
+  if(coins<slW){toast('Need '+slW+' coins!',true);return}
+  slRun=true
+  const btn=document.getElementById('sl-btn'); if(btn)btn.disabled=true
+  const resEl=document.getElementById('sl-result'); if(resEl)resEl.style.display='none'
+  const nc=coins-slW; updCoins(nc)
+  await sb.from('profiles').update({coins:nc}).eq('id',CU.id)
+  const SYMS=['A','B','C','D','E','F']
+  let cnt=0
+  const iv=setInterval(()=>{
+    const s0=document.getElementById('s0'),s1=document.getElementById('s1'),s2=document.getElementById('s2')
+    if(s0)s0.textContent=SYMS[Math.floor(Math.random()*SYMS.length)]
+    if(s1)s1.textContent=SYMS[Math.floor(Math.random()*SYMS.length)]
+    if(s2)s2.textContent=SYMS[Math.floor(Math.random()*SYMS.length)]
+    cnt++
+    if(cnt>=10){
+      clearInterval(iv)
+      // Heavily weighted toward loss - jackpot 1%, 2match 8%, loss 91%
+      const r=Math.random()
+      let f
+      if(r<0.01){const s=SYMS[Math.floor(Math.random()*SYMS.length)];f=[s,s,s]}
+      else if(r<0.09){const s=SYMS[Math.floor(Math.random()*SYMS.length)];const o=SYMS.filter(x=>x!==s);f=[s,s,o[Math.floor(Math.random()*o.length)]].sort(()=>Math.random()-.5)}
+      else{
+        let attempt=0
+        do{f=SYMS.slice().sort(()=>Math.random()-.5).slice(0,3);attempt++}
+        while(attempt<20&&(f[0]===f[1]||f[1]===f[2]||f[0]===f[2]))
+      }
+      const s0=document.getElementById('s0'),s1=document.getElementById('s1'),s2=document.getElementById('s2')
+      if(s0)s0.textContent=f[0]; if(s1)s1.textContent=f[1]; if(s2)s2.textContent=f[2]
+      let pay=0; const res=document.getElementById('sl-result'); if(res)res.style.display='block'
+      const allMatch=f[0]===f[1]&&f[1]===f[2]
+      const twoMatch=f[0]===f[1]||f[1]===f[2]||f[0]===f[2]
+      if(allMatch){pay=slW*30; if(res){res.className='result-banner res-win';res.textContent='JACKPOT! 3 of a kind — +'+pay+' coins!'}}
+      else if(twoMatch){pay=slW*2; if(res){res.className='result-banner res-win';res.textContent='2 of a kind — +'+pay+' coins!'}}
+      else{if(res){res.className='result-banner res-lose';res.textContent='No match. Lost '+slW+' coins.'}}
+      if(pay>0){const nc2=coins+pay;updCoins(nc2);sb.from('profiles').update({coins:nc2}).eq('id',CU.id)}
+      if(btn){btn.disabled=false;btn.textContent='Spin ('+slW+' coins)'}
+      slRun=false
+      setTimeout(()=>{if(res)res.style.display='none'},3000)
+    }
+  },120)
+}
+
+// ── FIXED JOIN GROUP ──────────────────────────────────────────────────────
+async function joinGroup() {
+  const code = document.getElementById('join-code-inp').value.trim().toUpperCase()
+  if (!code) return
+  const { data: g, error: ge } = await sb.from('groups').select('id, name').eq('invite_code', code).maybeSingle()
+  if (ge) { toast('Error: ' + ge.message, true); return }
+  if (!g) { toast('Group not found — check the code', true); return }
+  const { data: existing } = await sb.from('group_members').select('id').eq('group_id', g.id).eq('user_id', CU.id).maybeSingle()
+  if (existing) { toast('Already a member!', true); return }
+  const { error } = await sb.from('group_members').insert({ group_id: g.id, user_id: CU.id, tonight_drinks: 0, season_drinks: 0, coins_won: 0, fantasy_points: 0 })
+  if (error) { toast('Could not join: ' + error.message, true); return }
+  document.getElementById('join-code-inp').value = ''
+  toast('Joined ' + g.name + '! Stats start at 0.'); loadGroups()
+}
+
+
+window.addEventListener('resize',()=>{if(document.getElementById('pg-casino')?.classList.contains('on'))initPlinko()})
+
+
+
+if ('serviceWorker' in navigator && location.protocol !== 'file:') {
+  navigator.serviceWorker.register('./service-worker.js').catch(() => {});
+}
+
+
+// ── ROUNDUP V2 FUNCTIONAL PATCH ───────────────────────────────────────────
+function escAttrV2(str){ return String(str||'').replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/"/g,'&quot;') }
+function pctChangeV2(s){ const prev = Number(s.prev_price || s.price || 0); const cur = Number(s.price || 0); return prev ? ((cur-prev)/prev*100) : 0 }
+async function ensureStockRowV2(drinkName){
+  let { data:s } = await sb.from('drink_stocks').select('*').eq('drink_name',drinkName).maybeSingle()
+  if(!s){
+    const base = BASE_PRICES?.[drinkName] || 5
+    const ins = await sb.from('drink_stocks').insert({drink_name:drinkName,price:base,prev_price:base,order_count:0,open_price:base,open_date:new Date().toDateString()}).select('*').single()
+    s = ins.data
+  }
+  return s
+}
+async function moveDrinkPriceV2(drinkName, direction, reason, strength=1){
+  const s = await ensureStockRowV2(drinkName); if(!s) return null
+  const old = Number(s.price||5)
+  let move = 0
+  if(direction==='buy') move = 0.45 + Math.random()*0.75
+  else if(direction==='sell') move = -(0.35*strength + Math.random()*0.55)
+  else if(direction==='log') move = 0.75 + Math.random()*1.25
+  else move = (Math.random()-.5)
+  const base = BASE_PRICES?.[drinkName] || old
+  const reversion = (base-old)*0.03
+  const next = Math.max(0.5, Math.min(50, Number((old + move + reversion).toFixed(1))))
+  const updates = {price:next, prev_price:old, order_count:(Number(s.order_count)||0) + (direction==='buy'||direction==='log'?1:0)}
+  const today = new Date().toDateString(); if(!s.open_price || s.open_date!==today){ updates.open_price=old; updates.open_date=today }
+  await sb.from('drink_stocks').update(updates).eq('id',s.id)
+  return {...s,...updates,_move:next-old,_reason:reason}
+}
+
+onSharesBought = async function(drinkName){ return await moveDrinkPriceV2(drinkName,'buy','buy order',1) }
+onSharesSold = async function(drinkName, shares){ return await moveDrinkPriceV2(drinkName,'sell','sell pressure',Math.max(1,Number(shares)||1)) }
+onDrinkLogged = async function(drinkName){
+  const moved = await moveDrinkPriceV2(drinkName,'log','drink logged',1)
+  if (document.getElementById('pg-home')?.classList.contains('on')) await loadMarket()
+  return moved
+}
+
+renderTicker = async function(stocks, holds){
+  if(!stocks.length){ document.getElementById('ticker-list').innerHTML='<div class="empty"><div class="empty-txt">No drink stocks yet</div></div>'; return }
+  let fanMems=[]
+  if(CU){ const {data}=await sb.from('group_members').select('drafted_drink, group_id, groups(name)').eq('user_id',CU.id).not('drafted_drink','is',null); fanMems=data||[] }
+  const myFantasyDrinks={}; fanMems.forEach(m=>{ if(m.drafted_drink) myFantasyDrinks[m.drafted_drink]=m.groups?.name||'Group' })
+  let totalVal=0,totalCost=0,dailyPnl=0
+  holds.forEach(h=>{ const s=stocks.find(x=>x.drink_name===h.drink_name); const cur=s?.price||h.avg_buy_price; const open=s?.open_price||cur; totalVal+=Math.round(cur*10*h.shares); totalCost+=Math.round(h.avg_buy_price*10*h.shares); dailyPnl+=Math.round((cur-open)*10*h.shares) })
+  const unrealized=totalVal-totalCost, allTime=(prof?.total_realized_pnl||0)+unrealized
+  ;[['h-daily-pnl',dailyPnl],['h-alltime-pnl',allTime],['h-unrealized',unrealized]].forEach(([id,val])=>{ const e=document.getElementById(id); if(e){e.textContent=(val>=0?'+':'')+val; e.style.color=val>=0?'var(--gr2)':'var(--re2)'} })
+  const pv=document.getElementById('h-port-val'); if(pv) pv.textContent=totalVal.toLocaleString(); const hh=document.getElementById('h-holds'); if(hh)hh.textContent=holds.length
+  document.getElementById('ticker-list').innerHTML = stocks.map((s,idx)=>{
+    const d=Number(s.price)-Number(s.prev_price||s.price), up=d>0.05, dn=d<-0.05, held=holds.find(h=>h.drink_name===s.drink_name), heldPnl=held?Math.round((s.price-held.avg_buy_price)*10*held.shares):null, isDraft=myFantasyDrinks[s.drink_name]
+    return `<div class="drink-row-v2" onclick="openDrinkDetail('${escAttrV2(s.drink_name)}')" style="${isDraft?'border-left:3px solid var(--pu);padding-left:8px':''}">
+      <div class="drink-dot-v2">${idx+1}</div>
+      <div style="min-width:0"><div class="t-name" style="display:flex;align-items:center;gap:6px;font-weight:800">${escHtml(s.drink_name)} ${isDraft?'<span class="badge badge-pu" style="font-size:9px">DRAFT</span>':''}</div>
+      <div style="font-size:11px;color:var(--t3);margin-top:3px">${held?`${held.shares} shares · P&L <span style="color:${heldPnl>=0?'var(--gr2)':'var(--re2)'}">${heldPnl>=0?'+':''}${heldPnl}</span>`:'Tap for chart, holders, volume'}</div></div>
+      <div class="drink-price-v2"><div class="m ${up?'up':dn?'dn':'flat'}">${up?'▲':dn?'▼':'—'} ${d>=0?'+':''}${d.toFixed(1)}</div><div class="p">${Number(s.price).toFixed(1)}</div></div>
+      <button class="t-btn buy-btn market-action" onclick="event.stopPropagation();buyStock('${escAttrV2(s.drink_name)}',${Number(s.price)})">Buy</button>
+    </div>`
+  }).join('')
+}
+
+buyStock = async function(name, price){
+  const live = await ensureStockRowV2(name); price = Number(live?.price || price)
+  const cost=Math.round(price*10)
+  if(coins<cost){toast('Not enough coins!',true);return}
+  const nc=coins-cost
+  await sb.from('profiles').update({coins:nc}).eq('id',CU.id)
+  const {data:ex}=await sb.from('stock_holdings').select('*').eq('user_id',CU.id).eq('drink_name',name).maybeSingle()
+  if(ex) await sb.from('stock_holdings').update({shares:(ex.shares||0)+1,avg_buy_price:(((ex.avg_buy_price||price)*(ex.shares||0))+price)/((ex.shares||0)+1)}).eq('id',ex.id)
+  else await sb.from('stock_holdings').insert({user_id:CU.id,drink_name:name,shares:1,avg_buy_price:price})
+  updCoins(nc)
+  const moved = await onSharesBought(name)
+  toast(`Bought ${name} · price ${moved? (moved._move>=0?'+':'')+moved._move.toFixed(1):'moved'}`)
+  await loadMarket()
+}
+
+sellStock = async function(name, shares, price){
+  const live=await ensureStockRowV2(name); price=Number(live?.price||price); shares=Number(shares)||1
+  const {data:h}=await sb.from('stock_holdings').select('avg_buy_price').eq('user_id',CU.id).eq('drink_name',name).maybeSingle()
+  const gain=Math.round(price*10*shares), cost=h?Math.round(h.avg_buy_price*10*shares):gain, realized=gain-cost, nc=coins+gain
+  if(prof) prof.total_realized_pnl=(prof.total_realized_pnl||0)+realized
+  await sb.from('profiles').update({coins:nc,total_realized_pnl:prof?.total_realized_pnl||realized}).eq('id',CU.id)
+  await sb.from('stock_holdings').update({shares:0}).eq('user_id',CU.id).eq('drink_name',name)
+  updCoins(nc)
+  const moved=await onSharesSold(name,shares)
+  toast(`Sold ${name} · P&L ${realized>=0?'+':''}${realized} · price ${moved?(moved._move>=0?'+':'')+moved._move.toFixed(1):'moved'}`)
+  await loadMarket()
+}
+
+async function openDrinkDetail(drinkName){
+  openModal('modal-drink-detail')
+  const box=document.getElementById('drink-detail-content'); if(!box)return
+  box.innerHTML='<div class="modal-title">Loading...</div>'
+  const [stockRes, logsRes, holdRes, holdersRes] = await Promise.all([
+    sb.from('drink_stocks').select('*').eq('drink_name',drinkName).maybeSingle(),
+    sb.from('drink_logs').select('logged_at,user_id,group_id').eq('drink_name',drinkName).gte('logged_at',new Date(Date.now()-24*60*60*1000).toISOString()),
+    sb.from('stock_holdings').select('*').eq('user_id',CU.id).eq('drink_name',drinkName).maybeSingle(),
+    sb.from('stock_holdings').select('shares,avg_buy_price,user_id').eq('drink_name',drinkName).gt('shares',0)
+  ])
+  const s=stockRes.data || await ensureStockRowV2(drinkName), logs=logsRes.data||[], hold=holdRes.data, holders=holdersRes.data||[]
+  const move=Number(s.price)-Number(s.prev_price||s.price), pc=pctChangeV2(s), heldVal=hold?Math.round(Number(s.price)*10*hold.shares):0
+  box.innerHTML = `<div class="modal-title">${escHtml(drinkName)}</div><div class="modal-sub">Drink stock detail · tap Buy from market to move price instantly</div>
+    <div class="roundup-v2-card"><div style="display:flex;align-items:flex-end;justify-content:space-between;gap:12px"><div><div style="font-size:40px;font-weight:900;letter-spacing:-1px">${Number(s.price).toFixed(1)}</div><div style="font-size:13px;color:${move>=0?'var(--gr2)':'var(--re2)'};font-weight:800">${move>=0?'+':''}${move.toFixed(1)} (${pc>=0?'+':''}${pc.toFixed(1)}%)</div></div><button class="btn btn-pu btn-sm" onclick="closeModal('modal-drink-detail');buyStock('${escAttrV2(drinkName)}',${Number(s.price)})">Buy 1</button></div><canvas class="spark" id="drink-spark"></canvas></div>
+    <div class="micro-stat-grid"><div class="micro-stat"><div class="l">24h logs</div><div class="v">${logs.length}</div></div><div class="micro-stat"><div class="l">Holders</div><div class="v">${holders.length}</div></div><div class="micro-stat"><div class="l">My shares</div><div class="v">${hold?.shares||0}</div></div></div>
+    <div class="roundup-v2-card"><div class="card-title" style="margin-bottom:10px">Position</div><div style="display:flex;justify-content:space-between;font-size:14px;margin-bottom:6px"><span style="color:var(--t2)">Average cost</span><b>${hold?Number(hold.avg_buy_price).toFixed(1):'—'}</b></div><div style="display:flex;justify-content:space-between;font-size:14px;margin-bottom:6px"><span style="color:var(--t2)">Market value</span><b>${heldVal.toLocaleString()} coins</b></div><div style="display:flex;justify-content:space-between;font-size:14px"><span style="color:var(--t2)">Order count</span><b>${s.order_count||0}</b></div></div>
+    <div class="roundup-v2-card"><div class="card-title" style="margin-bottom:10px">Recent activity</div>${logs.length?logs.slice(-6).reverse().map(l=>`<div style="font-size:13px;color:var(--t2);padding:7px 0;border-bottom:1px solid #ffffff0c">Logged ${new Date(l.logged_at).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}</div>`).join(''):'<div style="color:var(--t3);font-size:13px">No drink logs in the last 24 hours.</div>'}</div>`
+  setTimeout(()=>drawDrinkSparkV2(Number(s.prev_price||s.price),Number(s.price)),80)
+}
+function drawDrinkSparkV2(prev,cur){
+  const c=document.getElementById('drink-spark'); if(!c)return; const dpr=window.devicePixelRatio||1; c.width=c.clientWidth*dpr; c.height=c.clientHeight*dpr; const ctx=c.getContext('2d'); ctx.scale(dpr,dpr); const w=c.clientWidth,h=c.clientHeight; ctx.clearRect(0,0,w,h); const pts=[]; for(let i=0;i<18;i++){ const t=i/17; const val=prev+(cur-prev)*t+(Math.sin(i*1.7)*0.12); pts.push(val) } const min=Math.min(...pts)-.5,max=Math.max(...pts)+.5; ctx.beginPath(); pts.forEach((p,i)=>{ const x=10+i*(w-20)/(pts.length-1), y=h-10-(p-min)/(max-min)*(h-20); if(i)ctx.lineTo(x,y); else ctx.moveTo(x,y) }); ctx.lineWidth=3; ctx.strokeStyle=cur>=prev?'#55efc4':'#ff7675'; ctx.stroke(); }
+
+setMyLine = async function(){
+  const raw=document.getElementById('my-line-inp')?.value
+  const val=parseFloat(raw)
+  if(!Number.isFinite(val)||val<0||val>30){toast('Enter a line from 0.5 to 30.5',true);return}
+  if(Math.abs((val%1)-0.5)>0.001){toast('Over/Under lines must end in .5, like 4.5 or 7.5',true);return}
+  const expires=new Date(Date.now()+20*60*60*1000).toISOString()
+  const {error}=await sb.from('ou_lines').upsert({user_id:CU.id,group_id:curGroup.id,line:val,expires_at:expires,session_active:true,final_count:null},{onConflict:'user_id,group_id'})
+  if(error){toast('Error: '+error.message,true);return}
+  toast('Line set to '+val.toFixed(1)); gTab('play')
+}
+
+const _roundupOldRenderPlay = renderPlay
+renderPlay = async function(members,el){
+  await _roundupOldRenderPlay(members,el)
+  setTimeout(()=>{ const inp=document.getElementById('my-line-inp'); if(inp){ inp.step='0.5'; inp.placeholder='e.g. 6.5'; inp.inputMode='decimal'; const p=inp.parentElement; if(p && !document.getElementById('ou-half-note')) p.insertAdjacentHTML('beforebegin','<div class="ou-help" id="ou-half-note">Over/Under lines now must end in <b>.5</b>. Example: 3.5, 6.5, 10.5.</div>') } },0)
+}
+
+const _roundupOldRenderFantasy = renderFantasy
+renderFantasy = async function(members,el){
+  await _roundupOldRenderFantasy(members,el)
+  const sorted=[...members].sort((a,b)=>(b.fantasy_points||0)-(a.fantasy_points||0))
+  if(!sorted.length) return
+  const getAlias=m=>m.display_name_override||m.profiles?.display_name||'Unknown'
+  const pairs=[]; for(let i=0;i<Math.ceil(sorted.length/2);i++){ const a=sorted[i], b=sorted[sorted.length-1-i]; if(a&&b&&a.user_id!==b.user_id)pairs.push([a,b]); else if(a)pairs.push([a,null]) }
+  const bracket=`<div class="roundup-v2-card" style="border-color:#8b5cf633"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px"><div><div style="font-size:15px;font-weight:900">Weekly Head-to-Head</div><div style="font-size:12px;color:var(--t3)">Bracket-style matchups based on current fantasy points</div></div><span class="badge badge-pu">ESPN style</span></div><div class="h2h-bracket">${pairs.map((p,i)=>{const a=p[0],b=p[1]; const aw=!b||(a.fantasy_points||0)>=(b.fantasy_points||0), bw=b&&!aw; return `<div class="h2h-match"><div style="font-size:11px;color:var(--t3);font-weight:700;margin-bottom:4px">MATCHUP ${i+1}</div><div class="h2h-team ${aw?'win':''}">${avEl(getAlias(a),26)}<b>${escHtml(getAlias(a))}</b><span class="h2h-score">${a.fantasy_points||0}</span></div>${b?`<div class="h2h-team ${bw?'win':''}">${avEl(getAlias(b),26)}<b>${escHtml(getAlias(b))}</b><span class="h2h-score">${b.fantasy_points||0}</span></div>`:`<div class="h2h-team"><span style="color:var(--t3)">BYE</span></div>`}</div>`}).join('')}</div></div>`
+  el.insertAdjacentHTML('afterbegin',bracket)
+}
+
+createGroup = async function(){
+  const name=document.getElementById('cg-name')?.value.trim(), pass=document.getElementById('cg-pass')?.value.trim()||null
+  if(!name){toast('Enter a group name',true);return}
+  let insert={name,created_by:CU.id}; if(pass) insert.join_passcode=pass
+  let {data:g,error}=await sb.from('groups').insert(insert).select().single()
+  if(error && String(error.message||'').includes('join_passcode')){ toast('Passcodes need the SQL update first. Group was not created.',true); return }
+  if(error||!g){toast('Error creating group: '+(error?.message||''),true);return}
+  await sb.from('group_members').insert({group_id:g.id,user_id:CU.id,tonight_drinks:0,season_drinks:0,coins_won:0,fantasy_points:0})
+  await sb.from('group_settings').insert({group_id:g.id,drink_multipliers:'{}'})
+  document.getElementById('cg-name').value=''; const pe=document.getElementById('cg-pass'); if(pe)pe.value=''
+  closeModal('modal-create-group'); toast('Created! Code: '+g.invite_code+(pass?' · passcode required':'')); loadGroups()
+}
+joinGroup = async function(){
+  const code=document.getElementById('join-code-inp')?.value.trim().toUpperCase(), pass=document.getElementById('join-pass-inp')?.value.trim()||''
+  if(!code)return
+  const {data:g,error:ge}=await sb.from('groups').select('id,name,join_passcode').eq('invite_code',code).maybeSingle()
+  if(ge && String(ge.message||'').includes('join_passcode')){ toast('Run the passcode SQL update, then try again.',true); return }
+  if(ge||!g){toast('Group not found',true);return}
+  if(g.join_passcode && g.join_passcode!==pass){toast('Incorrect group passcode',true);return}
+  const {data:existing}=await sb.from('group_members').select('id').eq('group_id',g.id).eq('user_id',CU.id).maybeSingle()
+  if(existing){toast('Already a member!',true);return}
+  const {error}=await sb.from('group_members').insert({group_id:g.id,user_id:CU.id,tonight_drinks:0,season_drinks:0,coins_won:0,fantasy_points:0})
+  if(error){toast('Could not join: '+error.message,true);return}
+  document.getElementById('join-code-inp').value=''; const j=document.getElementById('join-pass-inp'); if(j)j.value=''
+  toast('Joined '+g.name+'!'); loadGroups()
+}
+
+// Improve chat after every render in case mobile Safari wraps weirdly.
+const _roundupOldRenderChatMsg = renderChatMsg
+renderChatMsg = function(msg,aliasMap={},picMap={}){
+  return _roundupOldRenderChatMsg(msg,aliasMap,picMap).replace('<div style="max-width:72%">','<div style="max-width:78%;min-width:0;writing-mode:horizontal-tb">')
+}
+
